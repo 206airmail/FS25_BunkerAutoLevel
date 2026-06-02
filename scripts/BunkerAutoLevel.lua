@@ -47,22 +47,15 @@ BunkerAutoLevel.MIN_FILL_LEVEL = 100
 -- the heap also slopes gently down to that wall instead of packing dead flat.
 BunkerAutoLevel.WALL_OFFSET = 1.0
 
--- Half-length (metres) of the short cross line the material is tipped along at the
--- anchor (a small span, not a point, to avoid a sharp central spike).
-BunkerAutoLevel.ANCHOR_HALF = 2.0
+-- Deposit grid cell size (metres). Footprint is swept as a grid of cells this big;
+-- each cell is capped at its local allowed (crown) height. Smaller = smoother
+-- profile, more tip calls.
+BunkerAutoLevel.GRID_STEP = 2.0
 
--- Litres deposited per chunk while growing a layer. Smaller = smoother spread and
--- finer height tracking, at more iterations.
+-- Litres offered per cell tip call (engine caps to the cell's allowed height).
 BunkerAutoLevel.CHUNK_LITERS = 5000.0
 
--- A layer is considered "full" after this many consecutive chunks place less than
--- STALL_FRACTION of what was offered (the engine has stopped accepting at this
--- height); then we advance to the next 1m level.
-BunkerAutoLevel.LAYER_STALL_LIMIT = 3
-BunkerAutoLevel.STALL_FRACTION = 0.05
-
--- Fallback max heap height (metres) if a silo has no interaction trigger node to
--- read the height from.
+-- Fallback max heap height (metres) if a silo's trigger/wall height can't be read.
 BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
 
 -- Set true to print volume/edge/placement diagnostics to the log on each level.
@@ -319,20 +312,18 @@ function BunkerAutoLevel.redistributeEvenly(silo, fillType, volume)
 
     local radius = DensityMapHeightUtil.getDefaultMaxRadius(fillType) or 1.0
 
-    -- Unified anchor-growth deposit: pile from an anchor (1m off walled ends /
-    -- corner, centred on open axes), build to 1m, spread outward, then 2m, 3m ...
-    -- up to the cap. The engine spreads at the natural repose angle and packs
-    -- against the silo's tip-collision walls, so a partial fill is a centred pile
-    -- and a full fill reaches all walls.
+    -- Two-height 45° crown deposit: mound from the anchor, capped per-point at the
+    -- allowed-height profile (flush to wall tops at walled edges, 45° crown above
+    -- walls toward centre up to the trigger top, 45° ramp to floor at open ends).
     local placed = BunkerAutoLevel.depositFromAnchor(geo, fillType, radius, volume, edges, true)
 
     if BunkerAutoLevel.DEBUG then
         Logging.info(
-            "[%s] level: vol=%.0fl placed=%.0fl leftover=%.0fl edges(F/B/L/R open)=%s/%s/%s/%s len=%.1f wid=%.1f cap=%.1fm r=%.2f",
+            "[%s] level: vol=%.0fl placed=%.0fl leftover=%.0fl edges(F/B/L/R open)=%s/%s/%s/%s len=%.1f wid=%.1f wall=%.1fm top=%.1fm r=%.2f",
             BunkerAutoLevel.MOD_NAME, volume, placed, math.max(0, volume - placed),
             tostring(edges.frontOpen), tostring(edges.backOpen),
             tostring(edges.leftOpen), tostring(edges.rightOpen),
-            geo.length, geo.width, geo.capHeight, radius)
+            geo.length, geo.width, geo.wallHeight, geo.triggerTop, radius)
     end
 
     return math.max(0, volume - placed)
@@ -351,58 +342,104 @@ function BunkerAutoLevel.anchorOnAxis(len, openLow, openHigh)
     end
 end
 
---- Unified deposit: anchor the heap (1m off any walled end / corner, centred on
--- open axes) and grow it layer by layer. For each 1m level up to the cap, tip the
--- remaining material at the anchor with limitToLineHeight capped at that level; the
--- engine spreads it outward at the repose angle and packs it against the silo's
--- tip-collision walls. Move to the next level only once the current one stops
--- accepting material (footprint filled to that depth). VOLUME-CONSERVING.
--- @return total litres placed.
+--- Allowed heap height (metres above floor) at a point given by its along/across
+-- offsets inside the silo area. Each edge contributes (edgeHeight + distanceToEdge)
+-- at a 45° slope (tan45 = 1); the allowed height is the MIN over all four edges,
+-- clamped to the trigger-top ceiling. Walled edge height = wallHeight; OPEN edge (or
+-- wall-less side) = 0, which yields a 45° ramp down to the floor at the opening.
+-- @param along distance from the front (offset 0) along the length axis.
+-- @param across distance from the left (offset 0) along the width axis.
+function BunkerAutoLevel.allowedHeight(geo, edges, along, across)
+    local wh = geo.wallHeight
+    local hFront = edges.frontOpen and 0.0 or wh
+    local hBack  = edges.backOpen  and 0.0 or wh
+    local hLeft  = edges.leftOpen  and 0.0 or wh
+    local hRight = edges.rightOpen and 0.0 or wh
+
+    local dFront = along
+    local dBack  = geo.length - along
+    local dLeft  = across
+    local dRight = geo.width - across
+
+    local a = math.min(hFront + dFront, hBack + dBack, hLeft + dLeft, hRight + dRight)
+    return math.min(a, geo.triggerTop)
+end
+
+--- Unified deposit with the two-height 45° crown profile. Sweeps a grid of short
+-- cross-lines over the footprint; each cell is capped at its local allowedHeight
+-- (flush to wall tops at walled edges, 45° crown above the walls toward the centre,
+-- 45° ramp to the floor at open ends). Fills bottom-up in 1m layers so a partial
+-- amount makes a centred mound and a full amount makes the crowned shape.
+-- VOLUME-CONSERVING. @return total litres placed.
 function BunkerAutoLevel.depositFromAnchor(geo, fillType, radius, volume, edges, apply)
     if volume <= 0 then
         return 0
     end
 
-    -- Anchor position from the walls.
-    local along = BunkerAutoLevel.anchorOnAxis(geo.length, edges.frontOpen, edges.backOpen)
-    local across = BunkerAutoLevel.anchorOnAxis(geo.width, edges.leftOpen, edges.rightOpen)
-    local ax = geo.sx + geo.lnx * along + geo.wnx * across
-    local az = geo.sz + geo.lnz * along + geo.wnz * across
+    -- Grid of deposit cells across the footprint (centres at half-steps).
+    local step = BunkerAutoLevel.GRID_STEP
+    local nA = math.max(1, math.floor(geo.length / step + 0.5))   -- along length
+    local nC = math.max(1, math.floor(geo.width / step + 0.5))    -- across width
+    local stepA = geo.length / nA
+    local stepC = geo.width / nC
+    local halfC = stepC * 0.5   -- each cell deposits a short cross-line of this half-len
 
-    -- Short cross line at the anchor so the source isn't a single sharp spike.
-    local half = math.max(0.0, math.min(BunkerAutoLevel.ANCHOR_HALF, geo.width * 0.5 - 0.1, geo.length * 0.5 - 0.1))
-    local sx = ax - geo.wnx * half
-    local sz = az - geo.wnz * half
-    local ex = ax + geo.wnx * half
-    local ez = az + geo.wnz * half
+    -- Anchor (1m off walled ends / corner, centred on open axes) — material mounds
+    -- here first, so a partial amount makes a centred pile near the anchor.
+    local anchorAlong = BunkerAutoLevel.anchorOnAxis(geo.length, edges.frontOpen, edges.backOpen)
+    local anchorAcross = BunkerAutoLevel.anchorOnAxis(geo.width, edges.leftOpen, edges.rightOpen)
 
-    local capLevels = math.max(1, math.floor(geo.capHeight + 0.0001))
+    -- Precompute each cell's centre offsets, allowed cap height, and distance to the
+    -- anchor. Fill CLOSEST-to-anchor cells first so material mounds at the anchor and
+    -- spreads outward; each cell is still capped at its own allowed (crown) height.
+    local cells = {}
+    for ia = 0, nA - 1 do
+        local along = (ia + 0.5) * stepA
+        for ic = 0, nC - 1 do
+            local across = (ic + 0.5) * stepC
+            local capH = BunkerAutoLevel.allowedHeight(geo, edges, along, across)
+            if capH > 0.05 then
+                local da = along - anchorAlong
+                local dc = across - anchorAcross
+                cells[#cells + 1] = { along = along, across = across, capH = capH,
+                                      dist = da * da + dc * dc }
+            end
+        end
+    end
+    -- Nearest-to-anchor first.
+    table.sort(cells, function(p, q) return p.dist < q.dist end)
+
     local remaining = volume
     local totalPlaced = 0
 
-    -- Each level: keep tipping (capped at floorY+level) in chunks until the layer
-    -- stops accepting material, then go up a level. A chunk that places ~nothing
-    -- means this level is full -> advance.
-    for level = 1, capLevels do
+    -- Fill in 1m height bands from the floor up. In each band, deposit at every cell
+    -- whose allowed height reaches into the band, capped at min(bandTop, cellCap).
+    local maxLevels = math.max(1, math.ceil(geo.triggerTop + 0.0001))
+    for level = 1, maxLevels do
         if remaining <= 0 then break end
-        local capY = geo.floorY + level
+        local bandTop = level
 
-        local stalls = 0
-        while remaining > 0 and stalls < BunkerAutoLevel.LAYER_STALL_LIMIT do
-            local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
-            local placed = DensityMapHeightUtil.tipToGroundAroundLine(
-                nil, chunk, fillType,
-                sx, capY, sz, ex, capY, ez,
-                0.0, radius, nil,
-                true,           -- limitToLineHeight=true: fill UP TO capY (this layer)
-                nil, false, apply)
-            placed = placed or 0
-            remaining = remaining - placed
-            totalPlaced = totalPlaced + placed
-            if placed < chunk * BunkerAutoLevel.STALL_FRACTION then
-                stalls = stalls + 1   -- engine took little -> this level nearly full
-            else
-                stalls = 0
+        for _, c in ipairs(cells) do
+            if remaining <= 0 then break end
+            if c.capH > (level - 1) + 0.01 then          -- this cell reaches this band
+                local cellCapY = geo.floorY + math.min(bandTop, c.capH)
+                local cx = geo.sx + geo.lnx * c.along + geo.wnx * c.across
+                local cz = geo.sz + geo.lnz * c.along + geo.wnz * c.across
+                local sx = cx - geo.wnx * halfC
+                local sz = cz - geo.wnz * halfC
+                local ex = cx + geo.wnx * halfC
+                local ez = cz + geo.wnz * halfC
+
+                local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
+                local placed = DensityMapHeightUtil.tipToGroundAroundLine(
+                    nil, chunk, fillType,
+                    sx, cellCapY, sz, ex, cellCapY, ez,
+                    0.0, radius, nil,
+                    true,            -- limitToLineHeight: cap at this cell's allowed Y
+                    nil, false, apply)
+                placed = placed or 0
+                remaining = remaining - placed
+                totalPlaced = totalPlaced + placed
             end
         end
     end
@@ -432,58 +469,50 @@ function BunkerAutoLevel.computeGeometry(silo)
     -- node's world Y as the floor reference.
     local floorY = area.sy
 
-    -- Max heap height above the floor. Different silos encode the usable height
-    -- differently, so try several sources in order and take the first sane value:
-    --   1. trigger node TRANSLATION Y above floor (stock medium silo: ~7m)
-    --   2. trigger SHAPE vertical reach = bounding-sphere centre.y + radius above
-    --      floor (field silos put the height in the box geometry, node Y at floor)
-    --   3. wallLeft SHAPE vertical reach (a real side wall's top)
-    --   4. DEFAULT_MAX_HEIGHT fallback
-    local capHeight = BunkerAutoLevel.DEFAULT_MAX_HEIGHT
-    local capSource = "default"
-
-    local function shapeTopAboveFloor(node)
-        if node == nil or getShapeBoundingSphere == nil then return nil end
-        -- bounding sphere centre is in the node's LOCAL frame; convert to world.
-        local lcx, lcy, lcz, r = getShapeBoundingSphere(node)
-        if r == nil or r <= 0 then return nil end
-        local _, wcy, _ = localToWorld(node, lcx, lcy, lcz)
-        return (wcy + r) - floorY
-    end
-
-    local triggerNodeH = nil
-    if silo.interactionTriggerNode ~= nil then
-        local _, ty, _ = getWorldTranslation(silo.interactionTriggerNode)
-        triggerNodeH = ty - floorY
-        if triggerNodeH > 0.5 then
-            capHeight, capSource = triggerNodeH, "triggerNodeY"
+    -- TRIGGER-TOP height (centre ceiling) = top of the interaction trigger box
+    -- above the floor, via its world AABB (NOT the bounding sphere — a wide box's
+    -- sphere radius is dominated by its width and grossly overestimates height).
+    local triggerTop = BunkerAutoLevel.DEFAULT_MAX_HEIGHT
+    local tNode = silo.interactionTriggerNode
+    if tNode ~= nil and getRigidBodyAABB ~= nil then
+        local _, _, _, maxY = getRigidBodyAABB(tNode)
+        if maxY ~= nil then
+            local h = maxY - floorY
+            if h > 0.5 then triggerTop = h end
         end
     end
 
-    if capSource == "default" then
-        local triggerShapeH = shapeTopAboveFloor(silo.interactionTriggerNode)
-        if triggerShapeH ~= nil and triggerShapeH > 0.5 then
-            capHeight, capSource = triggerShapeH, "triggerShape"
-        end
+    -- WALL height (edge cap for walled sides) = top of a wall collision above the
+    -- floor. The base silo only has wallLeft/wallRight; use the taller of the two.
+    local wallHeight = 0.0
+    local function wallTop(w)
+        if w == nil then return nil end
+        local node = w.collision or w.node
+        if node == nil or getRigidBodyAABB == nil then return nil end
+        local _, _, _, maxY = getRigidBodyAABB(node)
+        if maxY == nil then return nil end
+        return maxY - floorY
     end
-
-    if capSource == "default" and silo.wallLeft ~= nil then
-        local wallH = shapeTopAboveFloor(silo.wallLeft.node)
-        if wallH ~= nil and wallH > 0.5 then
-            capHeight, capSource = wallH, "wallShape"
-        end
+    local wl, wr = wallTop(silo.wallLeft), wallTop(silo.wallRight)
+    if wl ~= nil and wl > wallHeight then wallHeight = wl end
+    if wr ~= nil and wr > wallHeight then wallHeight = wr end
+    if wallHeight <= 0.5 then
+        -- No readable wall collision; assume walls match the trigger-implied height.
+        wallHeight = math.min(triggerTop, BunkerAutoLevel.DEFAULT_MAX_HEIGHT)
     end
 
     if BunkerAutoLevel.DEBUG then
-        Logging.info("[%s]  cap: triggerNodeH=%s -> %.2fm (%s)",
-            BunkerAutoLevel.MOD_NAME, tostring(triggerNodeH), capHeight, capSource)
+        Logging.info("[%s]  heights: floorY=%.2f wallHeight=%.2fm triggerTop=%.2fm",
+            BunkerAutoLevel.MOD_NAME, floorY, wallHeight, triggerTop)
     end
 
     return {
         area = area,
         sx = area.sx, sz = area.sz,
         floorY = floorY,
-        capHeight = capHeight,
+        wallHeight = wallHeight,   -- edge cap at WALLED edges
+        triggerTop = triggerTop,   -- absolute ceiling at the centre
+        capHeight = triggerTop,    -- legacy field (some code reads capHeight)
         dhx = area.dhx, dhz = area.dhz,
         dwx = area.dwx, dwz = area.dwz,
         length = length, width = width,
