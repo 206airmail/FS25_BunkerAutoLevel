@@ -43,26 +43,27 @@ BunkerAutoLevel.MOD_DIRECTORY = g_currentModDirectory
 -- Minimum volume (litres) that must be present before a level pass does anything.
 BunkerAutoLevel.MIN_FILL_LEVEL = 100
 
--- Spacing (metres) between adjacent deposit lines swept across the silo width.
--- Smaller = flatter top but more passes (slower). ~1m merges cleanly with the
--- default tip radius.
-BunkerAutoLevel.LINE_SPACING = 1.0
-
--- How far (metres) the initial tip point sits IN FROM a walled end / corner, so
+-- How far (metres) the anchor (tip point) sits IN FROM a walled end / corner, so
 -- the heap also slopes gently down to that wall instead of packing dead flat.
 BunkerAutoLevel.WALL_OFFSET = 1.0
+
+-- Half-length (metres) of the short cross line the material is tipped along at the
+-- anchor (a small span, not a point, to avoid a sharp central spike).
+BunkerAutoLevel.ANCHOR_HALF = 2.0
+
+-- Litres deposited per chunk while growing a layer. Smaller = smoother spread and
+-- finer height tracking, at more iterations.
+BunkerAutoLevel.CHUNK_LITERS = 5000.0
+
+-- A layer is considered "full" after this many consecutive chunks place less than
+-- STALL_FRACTION of what was offered (the engine has stopped accepting at this
+-- height); then we advance to the next 1m level.
+BunkerAutoLevel.LAYER_STALL_LIMIT = 3
+BunkerAutoLevel.STALL_FRACTION = 0.05
 
 -- Fallback max heap height (metres) if a silo has no interaction trigger node to
 -- read the height from.
 BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
-
--- Litres per cubic metre, for metering per-line deposit shares (FS25 fill volumes
--- are litres; 1 m^3 = 1000 l).
-BunkerAutoLevel.LITERS_PER_M3 = 1000.0
-
--- If the material can't cover the whole floor to ~this depth (metres), deposit a
--- single centred pile instead of a thin partial layer.
-BunkerAutoLevel.MIN_LAYER_DEPTH = 1.0
 
 -- Set true to print volume/edge/placement diagnostics to the log on each level.
 BunkerAutoLevel.DEBUG = true
@@ -318,26 +319,17 @@ function BunkerAutoLevel.redistributeEvenly(silo, fillType, volume)
 
     local radius = DensityMapHeightUtil.getDefaultMaxRadius(fillType) or 1.0
 
-    -- Footprint area (m^2) and the volume needed to cover it to MIN_LAYER_DEPTH.
-    -- If we have less than that, a thin layer over the whole floor looks wrong —
-    -- a centred pile is what you'd actually get, so deposit that instead.
-    local footprint = geo.length * geo.width
-    local coverVolume = footprint * BunkerAutoLevel.MIN_LAYER_DEPTH * BunkerAutoLevel.LITERS_PER_M3
-
-    local mode, placed
-    if volume < coverVolume then
-        mode = "pile"
-        placed = BunkerAutoLevel.depositCenteredPile(geo, fillType, radius, volume, true)
-    else
-        mode = "layer"
-        placed = BunkerAutoLevel.depositLayered(geo, fillType, radius, volume, edges, true)
-    end
+    -- Unified anchor-growth deposit: pile from an anchor (1m off walled ends /
+    -- corner, centred on open axes), build to 1m, spread outward, then 2m, 3m ...
+    -- up to the cap. The engine spreads at the natural repose angle and packs
+    -- against the silo's tip-collision walls, so a partial fill is a centred pile
+    -- and a full fill reaches all walls.
+    local placed = BunkerAutoLevel.depositFromAnchor(geo, fillType, radius, volume, edges, true)
 
     if BunkerAutoLevel.DEBUG then
         Logging.info(
-            "[%s] level: vol=%.0fl placed=%.0fl leftover=%.0fl mode=%s coverVol=%.0fl edges(F/B/L/R open)=%s/%s/%s/%s len=%.1f wid=%.1f cap=%.1fm r=%.2f",
+            "[%s] level: vol=%.0fl placed=%.0fl leftover=%.0fl edges(F/B/L/R open)=%s/%s/%s/%s len=%.1f wid=%.1f cap=%.1fm r=%.2f",
             BunkerAutoLevel.MOD_NAME, volume, placed, math.max(0, volume - placed),
-            mode, coverVolume,
             tostring(edges.frontOpen), tostring(edges.backOpen),
             tostring(edges.leftOpen), tostring(edges.rightOpen),
             geo.length, geo.width, geo.capHeight, radius)
@@ -346,41 +338,75 @@ function BunkerAutoLevel.redistributeEvenly(silo, fillType, volume)
     return math.max(0, volume - placed)
 end
 
---- Deposit `volume` as a single centred pile (used when there isn't enough to
--- cover the whole floor). Tips the whole amount at the silo centre and lets the
--- engine slope it out at the natural angle of repose. VOLUME-CONSERVING.
-function BunkerAutoLevel.depositCenteredPile(geo, fillType, radius, volume, apply)
+--- Anchor offset along an axis: 1m in from a walled end, centre when open (or both
+-- walled). openLow = open at offset 0, openHigh = open at axis length.
+function BunkerAutoLevel.anchorOnAxis(len, openLow, openHigh)
+    local off = BunkerAutoLevel.WALL_OFFSET
+    if openLow == openHigh then
+        return len * 0.5                         -- both open / both walled -> centre
+    elseif not openLow then
+        return math.min(off, len * 0.5)          -- walled at low end -> 1m in
+    else
+        return math.max(len - off, len * 0.5)    -- walled at high end -> 1m in
+    end
+end
+
+--- Unified deposit: anchor the heap (1m off any walled end / corner, centred on
+-- open axes) and grow it layer by layer. For each 1m level up to the cap, tip the
+-- remaining material at the anchor with limitToLineHeight capped at that level; the
+-- engine spreads it outward at the repose angle and packs it against the silo's
+-- tip-collision walls. Move to the next level only once the current one stops
+-- accepting material (footprint filled to that depth). VOLUME-CONSERVING.
+-- @return total litres placed.
+function BunkerAutoLevel.depositFromAnchor(geo, fillType, radius, volume, edges, apply)
     if volume <= 0 then
         return 0
     end
 
-    -- Centre of the silo area.
-    local cx = geo.sx + 0.5 * geo.dhx + 0.5 * geo.dwx
-    local cz = geo.sz + 0.5 * geo.dhz + 0.5 * geo.dwz
+    -- Anchor position from the walls.
+    local along = BunkerAutoLevel.anchorOnAxis(geo.length, edges.frontOpen, edges.backOpen)
+    local across = BunkerAutoLevel.anchorOnAxis(geo.width, edges.leftOpen, edges.rightOpen)
+    local ax = geo.sx + geo.lnx * along + geo.wnx * across
+    local az = geo.sz + geo.lnz * along + geo.wnz * across
 
-    -- Short cross line at the centre so the heap isn't a single sharp spike.
-    local half = math.min(2.0, geo.width * 0.5 - 0.1, geo.length * 0.5 - 0.1)
-    half = math.max(0.0, half)
-    local sx = cx - geo.wnx * half
-    local sz = cz - geo.wnz * half
-    local ex = cx + geo.wnx * half
-    local ez = cz + geo.wnz * half
+    -- Short cross line at the anchor so the source isn't a single sharp spike.
+    local half = math.max(0.0, math.min(BunkerAutoLevel.ANCHOR_HALF, geo.width * 0.5 - 0.1, geo.length * 0.5 - 0.1))
+    local sx = ax - geo.wnx * half
+    local sz = az - geo.wnz * half
+    local ex = ax + geo.wnx * half
+    local ez = az + geo.wnz * half
 
-    -- Deposit in chunks, re-reading the ground so it slumps outward into a pile.
-    local chunks = 8
-    local perChunk = volume / chunks
+    local capLevels = math.max(1, math.floor(geo.capHeight + 0.0001))
+    local remaining = volume
     local totalPlaced = 0
-    for _ = 1, chunks do
-        local sy = DensityMapHeightUtil.getHeightAtWorldPos(sx, 0, sz)
-        local ey = DensityMapHeightUtil.getHeightAtWorldPos(ex, 0, ez)
-        local placed = DensityMapHeightUtil.tipToGroundAroundLine(
-            nil, perChunk, fillType,
-            sx, sy, sz, ex, ey, ez,
-            0.0, radius, nil,
-            false,          -- limitToLineHeight=false: place the amount, natural slope
-            nil, false, apply)
-        totalPlaced = totalPlaced + (placed or 0)
+
+    -- Each level: keep tipping (capped at floorY+level) in chunks until the layer
+    -- stops accepting material, then go up a level. A chunk that places ~nothing
+    -- means this level is full -> advance.
+    for level = 1, capLevels do
+        if remaining <= 0 then break end
+        local capY = geo.floorY + level
+
+        local stalls = 0
+        while remaining > 0 and stalls < BunkerAutoLevel.LAYER_STALL_LIMIT do
+            local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
+            local placed = DensityMapHeightUtil.tipToGroundAroundLine(
+                nil, chunk, fillType,
+                sx, capY, sz, ex, capY, ez,
+                0.0, radius, nil,
+                true,           -- limitToLineHeight=true: fill UP TO capY (this layer)
+                nil, false, apply)
+            placed = placed or 0
+            remaining = remaining - placed
+            totalPlaced = totalPlaced + placed
+            if placed < chunk * BunkerAutoLevel.STALL_FRACTION then
+                stalls = stalls + 1   -- engine took little -> this level nearly full
+            else
+                stalls = 0
+            end
+        end
     end
+
     return totalPlaced
 end
 
@@ -507,135 +533,6 @@ function BunkerAutoLevel.probeEdgeIsWalled(geo, which)
 end
 
 
---- Layered fill: fill the footprint to 1m, then 2m ... up to the cap, stopping
--- when material runs out. VOLUME-CONSERVING (limitToLineHeight + per-line metering).
---
--- Geometry: deposit lines run PERPENDICULAR to the fill direction (i.e. across the
--- silo, wall-to-wall on the closed axis), and are STEPPED along the fill direction
--- starting from the deepest WALLED end toward the OPEN end. Each line is metered to
--- ~its strip's share of the current 1m layer (capped by remaining) so no single
--- line hogs the whole volume — that was why everything piled against one wall.
--- @return total litres placed.
-function BunkerAutoLevel.depositLayered(geo, fillType, radius, volume, edges, apply)
-    if volume <= 0 then
-        return 0
-    end
-
-    local margin = BunkerAutoLevel.WALL_OFFSET
-
-    -- Decide the FILL axis = the axis that has an open end (material slopes toward
-    -- the opening). Prefer the length axis; fall back to width; else (fully closed
-    -- or fully open) fill along the length from one end.
-    -- crossDir = unit vector the deposit LINE runs along (perpendicular to fill).
-    -- fillDir  = unit vector we STEP along (toward the open end).
-    local fillNx, fillNz, crossNx, crossNz, fillLen, crossLen
-    local crossLowInset, crossHighInset   -- insets at the two ends of the cross line
-    local fillStart, fillEnd              -- step range along fill axis
-
-    local function pickAxisAlongLength()
-        fillNx, fillNz = geo.lnx, geo.lnz
-        crossNx, crossNz = geo.wnx, geo.wnz
-        fillLen, crossLen = geo.length, geo.width
-        crossLowInset = edges.leftOpen and margin or 0.0
-        crossHighInset = edges.rightOpen and margin or 0.0
-        -- step from the WALLED end toward the OPEN end
-        if edges.frontOpen and not edges.backOpen then
-            fillStart, fillEnd = geo.length - margin, margin           -- open front: start at back
-        else
-            fillStart, fillEnd = (edges.backOpen and 0.0 or 0.0) + margin*0, math.max(0.01, geo.length - (edges.backOpen and margin or 0.0))
-            fillStart = 0.0
-        end
-    end
-    local function pickAxisAlongWidth()
-        fillNx, fillNz = geo.wnx, geo.wnz
-        crossNx, crossNz = geo.lnx, geo.lnz
-        fillLen, crossLen = geo.width, geo.length
-        crossLowInset = edges.frontOpen and margin or 0.0
-        crossHighInset = edges.backOpen and margin or 0.0
-        if edges.leftOpen and not edges.rightOpen then
-            fillStart, fillEnd = geo.width - margin, margin
-        else
-            fillStart, fillEnd = 0.0, math.max(0.01, geo.width - (edges.rightOpen and margin or 0.0))
-        end
-    end
-
-    -- Choose fill axis: the one with exactly one open end is ideal (clear slope dir).
-    local lengthHasOpen = edges.frontOpen or edges.backOpen
-    local widthHasOpen = edges.leftOpen or edges.rightOpen
-    if lengthHasOpen and not widthHasOpen then
-        pickAxisAlongLength()
-    elseif widthHasOpen and not lengthHasOpen then
-        pickAxisAlongWidth()
-    elseif lengthHasOpen then
-        -- both axes have an open edge (e.g. straight silo open both ends, or a
-        -- corner): fill along the longer axis for a tidier result.
-        if geo.length >= geo.width then pickAxisAlongLength() else pickAxisAlongWidth() end
-    else
-        -- fully closed (or fully open box): just fill along length from offset 0.
-        pickAxisAlongLength()
-    end
-
-    -- Cross-line endpoints (constant per step): from crossLowInset to crossLen-high.
-    local cLow = crossLowInset
-    local cHigh = math.max(cLow + 0.01, crossLen - crossHighInset)
-    local crossSpan = cHigh - cLow
-
-    -- Step layout along the fill axis.
-    local fillSpan = math.abs(fillEnd - fillStart)
-    local fillSign = (fillEnd >= fillStart) and 1 or -1
-    local numSteps = math.max(1, math.floor(fillSpan / BunkerAutoLevel.LINE_SPACING + 0.5))
-    local stepLen = fillSpan / numSteps
-
-    -- Per-line litres to raise one strip (stepLen x crossSpan) by 1m of layer.
-    local stripFootprint = stepLen * crossSpan
-    local perLineFull = stripFootprint * BunkerAutoLevel.LITERS_PER_M3
-
-    local capLevels = math.max(1, math.floor(geo.capHeight + 0.0001))
-    local remaining = volume
-    local totalPlaced = 0
-
-    for level = 1, capLevels do
-        if remaining <= 0 then break end
-        local lineY = geo.floorY + level
-
-        for s = 0, numSteps - 1 do
-            if remaining <= 0 then break end
-            local f = fillStart + fillSign * (s + 0.5) * stepLen
-
-            -- Base point on the fill axis, then the cross line across the silo.
-            local px = geo.sx + fillNx * f
-            local pz = geo.sz + fillNz * f
-            local sx = px + crossNx * cLow
-            local sz = pz + crossNz * cLow
-            local ex = px + crossNx * cHigh
-            local ez = pz + crossNz * cHigh
-
-            -- Meter this line to ~one strip's worth (plus a little headroom) so the
-            -- layer spreads across all steps instead of dumping at the first.
-            local delta = math.min(remaining, perLineFull * 1.25)
-
-            local placed = DensityMapHeightUtil.tipToGroundAroundLine(
-                nil,            -- vehicle
-                delta,
-                fillType,
-                sx, lineY, sz,
-                ex, lineY, ez,
-                0.0,            -- innerRadius
-                radius,         -- radius
-                nil,            -- lineOffset
-                true,           -- limitToLineHeight=true: fill UP TO lineY (this layer)
-                nil,            -- occlusionAreas
-                false,          -- useOcclusionAreas
-                apply           -- applyChanges
-            )
-            placed = placed or 0
-            remaining = remaining - placed
-            totalPlaced = totalPlaced + placed
-        end
-    end
-
-    return totalPlaced
-end
 
 -- Bootstrap -----------------------------------------------------------------
 -- extraSourceFiles run at mod load, before the mission starts. BunkerSilo is a
