@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<l10n>
+    <texts>
+        <text name="bunkerAutoLevel_action" text="Auto-Level Silo"/>
+        <text name="bunkerAutoLevel_done" text="Bunker silo leveled"/>
+    </texts>
+</l10n>

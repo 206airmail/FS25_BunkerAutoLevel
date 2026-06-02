@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<modDesc descVersion="109">
+    <author>206airmail</author>
+    <version>0.1.0.0</version>
+
+    <title>
+        <en>Bunker Auto Level</en>
+    </title>
+
+    <description>
+        <en>Automatically levels the fill heap inside bunker silos so the material is spread evenly across the whole silo without manually driving a leveling blade back and forth. Server-authoritative and multiplayer-safe.</en>
+    </description>
+
+    <iconFilename>modIcon.dds</iconFilename>
+
+    <multiplayer supported="true"/>
+
+    <extraSourceFiles>
+        <sourceFile filename="scripts/BunkerAutoLevel.lua"/>
+    </extraSourceFiles>
+
+    <l10n filenamePrefix="translations/translation"/>
+</modDesc>

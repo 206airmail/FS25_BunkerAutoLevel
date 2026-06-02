@@ -1,0 +1,15 @@
+# FS25 mod build artifacts
+*.zip
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
+log.txt
