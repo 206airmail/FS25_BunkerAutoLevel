@@ -80,13 +80,127 @@ function BunkerAutoLevel.install()
     -- Register our level function on every BunkerSilo instance.
     BunkerSilo.autoLevel = BunkerAutoLevel.autoLevel
 
-    -- NOTE: the trigger that *calls* autoLevel (activatable entry, keybind, or
-    -- "level while filling" tick) is intentionally not wired yet — that is the
-    -- next milestone and depends on the UX choice. autoLevel() itself is the
-    -- self-contained, testable core and is safe to call on the server directly,
-    -- e.g. from the in-game console for verification.
+    -- The keybind is registered/unregistered as the LOCAL player enters/leaves a
+    -- bunker, reusing the base game's existing interaction trigger (the same one
+    -- that drives the compaction HUD and the "cover silo" prompt). The trigger
+    -- callback's return value is unused by the engine, so an appended hook is safe.
+    BunkerSilo.interactionTriggerCallback =
+        Utils.appendedFunction(BunkerSilo.interactionTriggerCallback, BunkerAutoLevel.onInteractionTrigger)
 
-    Logging.info("[%s] installed (auto-level core ready)", BunkerAutoLevel.MOD_NAME)
+    -- Clean up our action event if a silo we were attached to is deleted while the
+    -- player is still in range (e.g. sold from under them).
+    BunkerSilo.delete = Utils.prependedFunction(BunkerSilo.delete, BunkerAutoLevel.onBunkerDelete)
+
+    -- Keep the keybind's visibility in sync with the silo's live state (so it
+    -- appears the moment the heap has material, while the player stands inside).
+    -- The base update already runs every frame while in range; we only do work for
+    -- the currently-active silo.
+    BunkerSilo.update = Utils.appendedFunction(BunkerSilo.update, BunkerAutoLevel.onBunkerUpdate)
+
+    Logging.info("[%s] installed (auto-level core + keybind ready)", BunkerAutoLevel.MOD_NAME)
+end
+
+-- Keybind registration -------------------------------------------------------
+-- We track at most one "active" silo at a time (the one whose trigger the local
+-- player most recently entered). Registration is purely client-side input state;
+-- the actual level request goes to the server via BunkerAutoLevelEvent.
+
+BunkerAutoLevel.activeSilo = nil
+BunkerAutoLevel.actionEventId = nil
+
+--- Appended to BunkerSilo:interactionTriggerCallback. Registers our keybind when
+-- the LOCAL player enters this silo's interaction trigger, and removes it on exit.
+-- Signature mirrors the base callback: (self, triggerId, otherId, onEnter, onLeave, ...)
+function BunkerAutoLevel:onInteractionTrigger(_, otherId, onEnter, onLeave, _, _)
+    local localPlayer = g_localPlayer
+    if localPlayer == nil then
+        return -- dedicated server has no local player; nothing to bind
+    end
+
+    -- Only react to the local player's own body entering/leaving (vehicles drive
+    -- the base game's per-vehicle path; the keybind is a player-context action).
+    if otherId ~= localPlayer.rootNode then
+        return
+    end
+
+    if onEnter then
+        BunkerAutoLevel.setActiveSilo(self)
+    elseif onLeave then
+        if BunkerAutoLevel.activeSilo == self then
+            BunkerAutoLevel.setActiveSilo(nil)
+        end
+    end
+end
+
+--- Prepended to BunkerSilo:delete. Drops our binding if the active silo is gone.
+function BunkerAutoLevel:onBunkerDelete()
+    if BunkerAutoLevel.activeSilo == self then
+        BunkerAutoLevel.setActiveSilo(nil)
+    end
+end
+
+--- Appended to BunkerSilo:update. Refreshes keybind visibility for the active silo
+-- so it tracks live fill state without the player having to re-enter the trigger.
+function BunkerAutoLevel:onBunkerUpdate(_)
+    if BunkerAutoLevel.activeSilo == self then
+        BunkerAutoLevel.updateActionVisibility()
+    end
+end
+
+--- Set (or clear) the silo the keybind currently targets, registering/removing
+-- the action event accordingly.
+function BunkerAutoLevel.setActiveSilo(silo)
+    BunkerAutoLevel.activeSilo = silo
+
+    if silo == nil then
+        if BunkerAutoLevel.actionEventId ~= nil then
+            g_inputBinding:removeActionEvent(BunkerAutoLevel.actionEventId)
+            BunkerAutoLevel.actionEventId = nil
+        end
+        return
+    end
+
+    if BunkerAutoLevel.actionEventId == nil then
+        local _, eventId = g_inputBinding:registerActionEvent(
+            InputAction.BUNKERAUTOLEVEL_LEVEL,
+            BunkerAutoLevel,
+            BunkerAutoLevel.onLevelAction,
+            false,  -- triggerUp
+            true,   -- triggerDown
+            false,  -- triggerAlways
+            true    -- startActive
+        )
+        BunkerAutoLevel.actionEventId = eventId
+        g_inputBinding:setActionEventText(eventId, g_i18n:getText("input_BUNKERAUTOLEVEL_LEVEL"))
+        g_inputBinding:setActionEventTextPriority(eventId, GS_PRIO_NORMAL)
+    end
+
+    BunkerAutoLevel.updateActionVisibility()
+end
+
+--- Show the keybind only when leveling is meaningful: silo in FILL state with
+-- material present. Call whenever the relevant state may have changed.
+function BunkerAutoLevel.updateActionVisibility()
+    if BunkerAutoLevel.actionEventId == nil then
+        return
+    end
+    local silo = BunkerAutoLevel.activeSilo
+    local visible = silo ~= nil
+        and silo.state == BunkerSilo.STATE_FILL
+        and (silo.fillLevel or 0) > 0
+    g_inputBinding:setActionEventActive(BunkerAutoLevel.actionEventId, visible)
+end
+
+--- Keypress handler: request a level of the active silo (client -> server).
+function BunkerAutoLevel:onLevelAction(_, _)
+    local silo = BunkerAutoLevel.activeSilo
+    if silo == nil then
+        return
+    end
+    if silo.state ~= BunkerSilo.STATE_FILL or (silo.fillLevel or 0) <= 0 then
+        return
+    end
+    BunkerAutoLevelEvent.sendRequest(silo)
 end
 
 --- Level the fill heap in this bunker silo. SERVER ONLY.

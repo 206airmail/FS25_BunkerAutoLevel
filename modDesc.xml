@@ -16,8 +16,19 @@
     <multiplayer supported="true"/>
 
     <extraSourceFiles>
+        <sourceFile filename="scripts/events/BunkerAutoLevelEvent.lua"/>
         <sourceFile filename="scripts/BunkerAutoLevel.lua"/>
     </extraSourceFiles>
+
+    <actions>
+        <action name="BUNKERAUTOLEVEL_LEVEL" category="ONFOOT VEHICLE" axisType="HALF" ignoreComboMask="false"/>
+    </actions>
+
+    <inputBinding>
+        <actionBinding action="BUNKERAUTOLEVEL_LEVEL">
+            <binding device="KB_MOUSE_DEFAULT" input="KEY_l" />
+        </actionBinding>
+    </inputBinding>
 
     <l10n filenamePrefix="translations/translation"/>
 </modDesc>
