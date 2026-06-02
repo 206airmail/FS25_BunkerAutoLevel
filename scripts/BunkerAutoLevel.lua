@@ -56,8 +56,13 @@ BunkerAutoLevel.WALL_OFFSET = 1.0
 BunkerAutoLevel.ANCHOR_LINE_HALF = 2.0
 
 -- Number of chunks the volume is deposited in at the anchor (re-reading the
--- ground between chunks so the heap slumps outward instead of spiking).
-BunkerAutoLevel.DEPOSIT_CHUNKS = 6
+-- ground between chunks so the heap slumps outward instead of spiking). More
+-- chunks = smoother fill + better height-cap tracking, at a little more cost.
+BunkerAutoLevel.DEPOSIT_CHUNKS = 12
+
+-- Fallback max heap height (metres) if a silo has no interaction trigger node to
+-- read the height from.
+BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
 
 -- Set true to print volume/edge/placement diagnostics to the log on each level.
 BunkerAutoLevel.DEBUG = true
@@ -313,11 +318,11 @@ function BunkerAutoLevel.redistributeEvenly(silo, fillType, volume)
 
     if BunkerAutoLevel.DEBUG then
         Logging.info(
-            "[%s] level: vol=%.0fl placed=%.0fl leftover=%.0fl edges(F/B/L/R open)=%s/%s/%s/%s len=%.1f wid=%.1f r=%.2f",
+            "[%s] level: vol=%.0fl placed=%.0fl leftover=%.0fl edges(F/B/L/R open)=%s/%s/%s/%s len=%.1f wid=%.1f cap=%.1fm r=%.2f",
             BunkerAutoLevel.MOD_NAME, volume, placed, math.max(0, volume - placed),
             tostring(edges.frontOpen), tostring(edges.backOpen),
             tostring(edges.leftOpen), tostring(edges.rightOpen),
-            geo.length, geo.width, radius)
+            geo.length, geo.width, geo.capHeight, radius)
     end
 
     return math.max(0, volume - placed)
@@ -341,9 +346,27 @@ function BunkerAutoLevel.computeGeometry(silo)
     local lnx, lnz = area.dhx / length, area.dhz / length
     local wnx, wnz = area.dwx / width, area.dwz / width
 
+    -- Floor Y: the area nodes sit at the silo floor (y=0 locally). Use the start
+    -- node's world Y as the floor reference.
+    local floorY = area.sy
+
+    -- Max heap height = the interaction trigger node's height above the floor.
+    -- The trigger is placed at the top of the usable silo volume (e.g. y=7 on the
+    -- stock medium silo). Fall back to a sane default if no trigger is present.
+    local capHeight = BunkerAutoLevel.DEFAULT_MAX_HEIGHT
+    if silo.interactionTriggerNode ~= nil then
+        local _, ty, _ = getWorldTranslation(silo.interactionTriggerNode)
+        local h = ty - floorY
+        if h > 0.5 then
+            capHeight = h
+        end
+    end
+
     return {
         area = area,
         sx = area.sx, sz = area.sz,
+        floorY = floorY,
+        capHeight = capHeight,
         dhx = area.dhx, dhz = area.dhz,
         dwx = area.dwx, dwz = area.dwz,
         length = length, width = width,
@@ -449,29 +472,64 @@ function BunkerAutoLevel.depositAtAnchor(geo, fillType, radius, volume, edges, a
         return 0
     end
 
-    -- Anchor offsets along each axis (1m in from any walled end/corner; centre when
-    -- that axis is open at both ends).
+    -- Initial anchor offsets along each axis (1m in from any walled end/corner;
+    -- centre when that axis is open at both ends).
     local along = BunkerAutoLevel.anchorOnAxis(geo.length, edges.frontOpen, edges.backOpen)
     local across = BunkerAutoLevel.anchorOnAxis(geo.width, edges.leftOpen, edges.rightOpen)
 
-    -- Anchor world position.
-    local ax = geo.sx + geo.lnx * along + geo.wnx * across
-    local az = geo.sz + geo.lnz * along + geo.wnz * across
+    -- Direction (along the length axis) the heap should EXTEND once it hits the
+    -- height cap — toward the open end. If the back end is walled and the front is
+    -- open, extend toward the front (-length), and vice versa. If both ends open or
+    -- both walled, don't advance (the heap just grows symmetrically / stays put).
+    local extendSign = 0
+    if edges.backOpen and not edges.frontOpen then
+        extendSign = 1   -- walled front, open back -> extend toward +length (back)
+    elseif edges.frontOpen and not edges.backOpen then
+        extendSign = -1  -- walled back, open front -> extend toward -length (front)
+    end
 
-    -- Short anchor line, oriented across the width, clamped to stay inside the
-    -- silo. A small span (not a point) avoids an unnaturally sharp spike.
+    -- Span limits along the length axis so the advancing anchor stays in bounds.
+    local minAlong = BunkerAutoLevel.WALL_OFFSET
+    local maxAlong = geo.length - BunkerAutoLevel.WALL_OFFSET
+
     local half = math.min(BunkerAutoLevel.ANCHOR_LINE_HALF, geo.width * 0.5 - 0.1)
     half = math.max(0.0, half)
-    local sx = ax - geo.wnx * half
-    local sz = az - geo.wnz * half
-    local ex = ax + geo.wnx * half
-    local ez = az + geo.wnz * half
+
+    local capY = geo.floorY + geo.capHeight
+    local advanceStep = math.max(radius, BunkerAutoLevel.rampRun(geo.capHeight) * 0.5)
 
     local chunks = math.max(1, BunkerAutoLevel.DEPOSIT_CHUNKS)
     local perChunk = volume / chunks
     local totalPlaced = 0
 
     for _ = 1, chunks do
+        -- Current anchor world position + short cross-width deposit line.
+        local ax = geo.sx + geo.lnx * along + geo.wnx * across
+        local az = geo.sz + geo.lnz * along + geo.wnz * across
+        local sx = ax - geo.wnx * half
+        local sz = az - geo.wnz * half
+        local ex = ax + geo.wnx * half
+        local ez = az + geo.wnz * half
+
+        -- If the heap at the anchor has reached the cap, advance the anchor toward
+        -- the open end so further material EXTENDS the heap rather than piling
+        -- higher than the walls.
+        if extendSign ~= 0 then
+            local peakY = math.max(
+                DensityMapHeightUtil.getHeightAtWorldPos(sx, 0, sz),
+                DensityMapHeightUtil.getHeightAtWorldPos(ex, 0, ez)
+            )
+            if peakY >= capY then
+                along = math.clamp(along + extendSign * advanceStep, minAlong, maxAlong)
+                ax = geo.sx + geo.lnx * along + geo.wnx * across
+                az = geo.sz + geo.lnz * along + geo.wnz * across
+                sx = ax - geo.wnx * half
+                sz = az - geo.wnz * half
+                ex = ax + geo.wnx * half
+                ez = az + geo.wnz * half
+            end
+        end
+
         -- Re-read ground each chunk so the heap builds on what's already slumped.
         local sy = DensityMapHeightUtil.getHeightAtWorldPos(sx, 0, sz)
         local ey = DensityMapHeightUtil.getHeightAtWorldPos(ex, 0, ez)
@@ -494,6 +552,11 @@ function BunkerAutoLevel.depositAtAnchor(geo, fillType, radius, volume, edges, a
     end
 
     return totalPlaced
+end
+
+--- Ramp run-out (metres) at the natural repose angle for a given height.
+function BunkerAutoLevel.rampRun(height)
+    return height / math.tan(math.rad(40))
 end
 
 -- Bootstrap -----------------------------------------------------------------
