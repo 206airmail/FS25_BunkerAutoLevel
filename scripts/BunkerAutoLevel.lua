@@ -168,19 +168,26 @@ function BunkerAutoLevel.redistributeEvenly(silo, fillType, volume)
         return volume
     end
 
-    -- Which short ends are open vs. walled.
-    local frontOpen = not BunkerAutoLevel.probeEndIsWalled(geo, true)
-    local backOpen = not BunkerAutoLevel.probeEndIsWalled(geo, false)
+    -- Detect which of the four edges are open vs. walled. The base BunkerSilo
+    -- only models the two long side walls, and some silos (flat field pads) have
+    -- NO walls at all, so we probe all four edges for static collision rather than
+    -- assuming. An open edge gets a drivable angle-of-repose ramp; a walled edge
+    -- packs flat against the wall.
+    local edges = {
+        frontOpen = not BunkerAutoLevel.probeEdgeIsWalled(geo, "front"),
+        backOpen  = not BunkerAutoLevel.probeEdgeIsWalled(geo, "back"),
+        leftOpen  = not BunkerAutoLevel.probeEdgeIsWalled(geo, "left"),
+        rightOpen = not BunkerAutoLevel.probeEdgeIsWalled(geo, "right"),
+    }
 
     local radius = DensityMapHeightUtil.getDefaultMaxRadius(fillType) or 1.0
 
-    -- Ramp run-out: how far an open end's slope reaches in from the edge for the
-    -- solved flat height. Computed inside the solver since it depends on height.
-    -- We bisect the flat-top height so total deposited volume ≈ requested volume.
-    local targetHeight = BunkerAutoLevel.solveFlatHeight(geo, volume, frontOpen, backOpen)
+    -- Bisect the flat-top height so total deposited volume ≈ requested volume.
+    -- Open edges consume volume as ~40° ramps, reducing the flat-top footprint.
+    local targetHeight = BunkerAutoLevel.solveFlatHeight(geo, volume, edges)
 
     -- Deposit the sweep at the solved height.
-    local placed = BunkerAutoLevel.depositSweep(geo, fillType, radius, targetHeight, frontOpen, backOpen, true)
+    local placed = BunkerAutoLevel.depositSweep(geo, fillType, radius, targetHeight, edges, true)
 
     return math.max(0, volume - placed)
 end
@@ -220,34 +227,52 @@ function BunkerAutoLevel.probeCallback(_)
     return false
 end
 
---- True if the given short end has a static wall just beyond it.
--- @param atFront true = probe the front end (offset 0); false = back end (offset length).
-function BunkerAutoLevel.probeEndIsWalled(geo, atFront)
-    -- Centre of the end edge, nudged just OUTSIDE the silo along the length axis.
-    local cx, cz, sign
-    if atFront then
-        sign = -1 -- front edge is at offset 0; outside is in the -length direction
-        cx = geo.sx + 0.5 * geo.dwx
-        cz = geo.sz + 0.5 * geo.dwz
-    else
-        sign = 1  -- back edge is at offset length; outside is in the +length direction
-        cx = geo.sx + geo.dhx + 0.5 * geo.dwx
-        cz = geo.sz + geo.dhz + 0.5 * geo.dwz
+--- True if the given edge has a static wall just beyond it.
+-- @param which "front"/"back" (the short ends, along the length axis) or
+--        "left"/"right" (the long sides, along the width axis).
+-- Probes an overlap box centred just OUTSIDE that edge, spanning the edge's
+-- length, thin in the outward direction. Long-side probes naturally hit the
+-- silo's own wallLeft/wallRight collision when present, and find nothing on a
+-- wall-less flat pad — exactly the discrimination we want.
+function BunkerAutoLevel.probeEdgeIsWalled(geo, which)
+    -- ecx/ecz = centre of the edge; onx/onz = OUTWARD unit normal of the edge;
+    -- span = full length of the edge (box half-extent along the edge direction).
+    local ecx, ecz, onx, onz, span
+    if which == "front" then
+        ecx = geo.sx + 0.5 * geo.dwx
+        ecz = geo.sz + 0.5 * geo.dwz
+        onx, onz = -geo.lnx, -geo.lnz
+        span = geo.width
+    elseif which == "back" then
+        ecx = geo.sx + geo.dhx + 0.5 * geo.dwx
+        ecz = geo.sz + geo.dhz + 0.5 * geo.dwz
+        onx, onz = geo.lnx, geo.lnz
+        span = geo.width
+    elseif which == "left" then
+        ecx = geo.sx + 0.5 * geo.dhx
+        ecz = geo.sz + 0.5 * geo.dhz
+        onx, onz = -geo.wnx, -geo.wnz
+        span = geo.length
+    else -- "right"
+        ecx = geo.sx + geo.dwx + 0.5 * geo.dhx
+        ecz = geo.sz + geo.dwz + 0.5 * geo.dhz
+        onx, onz = geo.wnx, geo.wnz
+        span = geo.length
     end
 
     local d = BunkerAutoLevel.WALL_PROBE_DISTANCE
-    local px = cx + sign * geo.lnx * (d * 0.5)
-    local pz = cz + sign * geo.lnz * (d * 0.5)
+    local px = ecx + onx * (d * 0.5)
+    local pz = ecz + onz * (d * 0.5)
     local py = DensityMapHeightUtil.getHeightAtWorldPos(px, 0, pz) + 1.0
 
-    -- Box: as wide as the silo, thin along length, ~2m tall. Rotated to align its
-    -- local Z with the length axis.
-    local rotY = MathUtil.getYRotationFromDirection(geo.lnx, geo.lnz)
+    -- Box local Z aligned to the outward normal: half-extents are
+    -- (along-edge = span/2, vertical = 1.0, outward = WALL_PROBE_HALF).
+    local rotY = MathUtil.getYRotationFromDirection(onx, onz)
     BunkerAutoLevel.probeResult.hit = false
     overlapBox(
         px, py, pz,
         0, rotY, 0,
-        geo.width * 0.5, 1.0, BunkerAutoLevel.WALL_PROBE_HALF,
+        span * 0.5, 1.0, BunkerAutoLevel.WALL_PROBE_HALF,
         "probeCallback", BunkerAutoLevel,
         BunkerAutoLevel.WALL_PROBE_MASK,
         true, true, true
@@ -255,34 +280,45 @@ function BunkerAutoLevel.probeEndIsWalled(geo, atFront)
     return BunkerAutoLevel.probeResult.hit
 end
 
+--- Ramp run-out (metres) for a given flat-top height at the natural repose angle.
+function BunkerAutoLevel.rampRun(height)
+    return height / math.tan(math.rad(40))
+end
+
 --- Estimate the deposited volume for a candidate flat-top height.
--- Flat top occupies the full width over the flat-top length; each OPEN end adds a
--- triangular-prism ramp of horizontal run = height / tan(reposeAngle).
--- Uses a fixed repose proxy (the engine's ~40° for chaff/silage) for the estimate;
--- actual placement is done by the engine, so this only needs to be close enough
--- to pick a good height before the deposit sweep.
-function BunkerAutoLevel.estimateVolume(geo, height, frontOpen, backOpen)
+-- The flat top shrinks on each axis by one ramp run-out per OPEN edge on that
+-- axis; the ramps themselves add roughly half-prism volume back. This is only an
+-- estimate to choose a height — the engine does the real placement.
+-- @param edges table { frontOpen, backOpen, leftOpen, rightOpen } booleans.
+function BunkerAutoLevel.estimateVolume(geo, height, edges)
     if height <= 0 then
         return 0
     end
-    local reposeTan = math.tan(math.rad(40))
-    local run = height / reposeTan          -- ramp horizontal run-out per open end
-    local openCount = (frontOpen and 1 or 0) + (backOpen and 1 or 0)
-    local flatLen = math.max(0, geo.length - openCount * run)
+    local run = BunkerAutoLevel.rampRun(height)
 
-    -- Flat slab volume (m^3) + half-prism ramp(s).
-    local slab = geo.width * flatLen * height
-    local ramps = openCount * (geo.width * run * height * 0.5)
-    local cubicM = slab + ramps
+    -- Flat-top footprint after pulling in from each open edge.
+    local lengthInset = (edges.frontOpen and run or 0) + (edges.backOpen and run or 0)
+    local widthInset = (edges.leftOpen and run or 0) + (edges.rightOpen and run or 0)
+    local flatLen = math.max(0, geo.length - lengthInset)
+    local flatWid = math.max(0, geo.width - widthInset)
+
+    -- Flat slab + a triangular ramp prism along each open edge (half-prism each).
+    local slab = flatLen * flatWid * height
+    local openOnLength = (edges.frontOpen and 1 or 0) + (edges.backOpen and 1 or 0)
+    local openOnWidth = (edges.leftOpen and 1 or 0) + (edges.rightOpen and 1 or 0)
+    local lengthRamps = openOnLength * (flatWid * run * height * 0.5)
+    local widthRamps = openOnWidth * (flatLen * run * height * 0.5)
+
+    local cubicM = slab + lengthRamps + widthRamps
     return cubicM * 1000 -- litres (1 m^3 = 1000 l)
 end
 
 --- Bisect the flat-top height so estimated volume matches the requested volume.
-function BunkerAutoLevel.solveFlatHeight(geo, volume, frontOpen, backOpen)
+function BunkerAutoLevel.solveFlatHeight(geo, volume, edges)
     local lo, hi = 0.0, 50.0 -- 50m is far above any real silo wall height
     for _ = 1, BunkerAutoLevel.HEIGHT_SOLVE_ITERATIONS do
         local mid = (lo + hi) * 0.5
-        if BunkerAutoLevel.estimateVolume(geo, mid, frontOpen, backOpen) < volume then
+        if BunkerAutoLevel.estimateVolume(geo, mid, edges) < volume then
             lo = mid
         else
             hi = mid
@@ -292,39 +328,46 @@ function BunkerAutoLevel.solveFlatHeight(geo, volume, frontOpen, backOpen)
 end
 
 --- Sweep deposit lines along the length axis, stepped across the width, capping
--- each to `height`. At open ends the line is pulled in by the ramp run-out; at
--- walled ends it runs to the very edge so material packs flat to the wall.
+-- each to `height`. Lines are pulled in from any OPEN edge by the ramp run-out so
+-- the engine's angle of repose forms a drivable ramp there; at WALLED edges they
+-- run to the very edge so material packs flat against the wall.
+-- @param edges table { frontOpen, backOpen, leftOpen, rightOpen } booleans.
 -- @param apply when false, only sums the would-be placement (dry run).
 -- @return total litres placed.
-function BunkerAutoLevel.depositSweep(geo, fillType, radius, height, frontOpen, backOpen, apply)
+function BunkerAutoLevel.depositSweep(geo, fillType, radius, height, edges, apply)
     if height <= 0 then
         return 0
     end
 
-    local reposeTan = math.tan(math.rad(40))
-    local run = height / reposeTan
-    local frontInset = frontOpen and run or 0.0
-    local backInset = backOpen and run or 0.0
+    local run = BunkerAutoLevel.rampRun(height)
 
-    -- Endpoints of each line along the length axis (front-inset .. length-back-inset).
-    local startDist = frontInset
-    local endDist = math.max(startDist, geo.length - backInset)
-
-    -- Per-line target volume so the whole sweep sums to the requested slab. We let
-    -- tipToGroundAroundLine place a generous delta and rely on limitToLineHeight to
-    -- cap the surface at `height`; leftover beyond the cap is reported and summed.
+    -- Inset along the length axis (front/back) for the line endpoints.
+    local startDist = edges.frontOpen and run or 0.0
+    local endDist = math.max(startDist, geo.length - (edges.backOpen and run or 0.0))
     local lineLen = math.max(0.01, endDist - startDist)
-    local numLines = math.max(1, math.floor(geo.width / BunkerAutoLevel.LINE_SPACING + 0.5))
-    local stepW = geo.width / numLines
+
+    -- Inset across the width (left/right) for which strips we lay lines in.
+    local leftInset = edges.leftOpen and run or 0.0
+    local rightInset = edges.rightOpen and run or 0.0
+    local flatWid = math.max(0.0, geo.width - leftInset - rightInset)
+    if flatWid <= 0 then
+        -- Silo narrower than two ramp run-outs: lay a single centre line so the
+        -- material still goes somewhere sensible rather than nothing.
+        leftInset = geo.width * 0.5
+        flatWid = 0.0
+    end
+
+    local numLines = math.max(1, math.floor((flatWid > 0 and flatWid or 0.01) / BunkerAutoLevel.LINE_SPACING + 0.5))
+    local stepW = (flatWid > 0 and flatWid or 0) / numLines
 
     local totalPlaced = 0
-    -- A generous per-line delta: the line's slab share, well above what the cap
-    -- will accept, so the engine fills up to `height` and returns the remainder.
-    local perLineDelta = (geo.width * lineLen * height * 1000) / numLines * 2.0
+    -- Generous per-line delta so the engine fills up to the cap and returns the
+    -- remainder; the limitToLineHeight cap is what actually flattens the top.
+    local perLineDelta = ((flatWid > 0 and flatWid or geo.width) * lineLen * height * 1000) / numLines * 2.0
 
     for i = 0, numLines - 1 do
-        -- Offset across the width to the centre of this line's strip.
-        local w = (i + 0.5) * stepW
+        -- Strip centre across the width, starting after the left inset.
+        local w = leftInset + (i + 0.5) * stepW
         local bx = geo.sx + geo.wnx * w
         local bz = geo.sz + geo.wnz * w
 
