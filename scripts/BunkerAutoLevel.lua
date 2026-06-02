@@ -50,10 +50,16 @@ BunkerAutoLevel.WALL_OFFSET = 1.0
 -- Deposit grid cell size (metres). Footprint is swept as a grid of cells this big;
 -- each cell is capped at its local allowed (crown) height. Smaller = smoother
 -- profile, more tip calls.
-BunkerAutoLevel.GRID_STEP = 2.0
+BunkerAutoLevel.GRID_STEP = 1.5
 
 -- Litres offered per cell tip call (engine caps to the cell's allowed height).
 BunkerAutoLevel.CHUNK_LITERS = 5000.0
+
+-- Post-deposit smoothing (blends the inter-cell ridges/valleys into one surface).
+BunkerAutoLevel.SMOOTH_STEP = 1.5     -- grid step (m) of the smoothing sweep
+BunkerAutoLevel.SMOOTH_RADIUS = 4.0   -- smoothing kernel radius (m)
+BunkerAutoLevel.SMOOTH_AMOUNT = 1.0   -- 0..1 blend strength per pass
+BunkerAutoLevel.SMOOTH_PASSES = 5     -- number of smoothing sweeps
 
 -- Fallback max heap height (metres) if a silo's trigger/wall height can't be read.
 BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
@@ -444,7 +450,58 @@ function BunkerAutoLevel.depositFromAnchor(geo, fillType, radius, volume, edges,
         end
     end
 
+    -- Smoothing pass: the grid of capped cell-tips leaves ridges/valleys between
+    -- cells. Sweep the footprint and smooth the height field to blend them into a
+    -- continuous surface. (Only fill types with allowsSmoothing, e.g. CHAFF, smooth;
+    -- SILAGE does not — but the silo input type is the chaff-like input fill.)
+    if apply then
+        BunkerAutoLevel.smoothFootprint(geo, edges)
+    end
+
     return totalPlaced
+end
+
+--- Smooth the deposited heap to remove the inter-cell ridges/valleys. Sweeps a grid
+-- over the footprint calling smoothDensityMapHeightAtWorldPos at each point. Runs a
+-- few passes for a cleaner surface.
+function BunkerAutoLevel.smoothFootprint(geo, edges)
+    if smoothDensityMapHeightAtWorldPos == nil then
+        return
+    end
+    local updater = g_densityMapHeightManager:getTerrainDetailHeightUpdater()
+    if updater == nil then
+        return
+    end
+    local tireId = g_currentMission.tireTrackSystem.tireTrackSystemId
+
+    local step = BunkerAutoLevel.SMOOTH_STEP
+    local nA = math.max(1, math.floor(geo.length / step + 0.5))
+    local nC = math.max(1, math.floor(geo.width / step + 0.5))
+    local stepA = geo.length / nA
+    local stepC = geo.width / nC
+    local smoothRadius = BunkerAutoLevel.SMOOTH_RADIUS
+    local smoothAmount = BunkerAutoLevel.SMOOTH_AMOUNT
+
+    for _ = 1, BunkerAutoLevel.SMOOTH_PASSES do
+        for ia = 0, nA - 1 do
+            local along = (ia + 0.5) * stepA
+            for ic = 0, nC - 1 do
+                local across = (ic + 0.5) * stepC
+                local x = geo.sx + geo.lnx * along + geo.wnx * across
+                local z = geo.sz + geo.lnz * along + geo.wnz * across
+                local y = DensityMapHeightUtil.getHeightAtWorldPos(x, 0, z)
+                local ht = DensityMapHeightUtil.getHeightTypeDescAtWorldPos(x, y, z, smoothRadius)
+                if ht ~= nil and ht.allowsSmoothing then
+                    smoothDensityMapHeightAtWorldPos(
+                        updater,
+                        x, y - ht.collisionBaseOffset, z,
+                        smoothAmount, ht.index,
+                        0, smoothRadius, smoothRadius + 1.2,
+                        tireId)
+                end
+            end
+        end
+    end
 end
 
 --- Precompute world-space geometry for the silo area (vectors, unit dirs, length).
