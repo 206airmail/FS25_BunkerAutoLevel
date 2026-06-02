@@ -52,14 +52,6 @@ BunkerAutoLevel.LINE_SPACING = 1.0
 -- the heap also slopes gently down to that wall instead of packing dead flat.
 BunkerAutoLevel.WALL_OFFSET = 1.0
 
--- Half-length (metres) of the short anchor line the volume is tipped along.
-BunkerAutoLevel.ANCHOR_LINE_HALF = 2.0
-
--- Number of chunks the volume is deposited in at the anchor (re-reading the
--- ground between chunks so the heap slumps outward instead of spiking). More
--- chunks = smoother fill + better height-cap tracking, at a little more cost.
-BunkerAutoLevel.DEPOSIT_CHUNKS = 12
-
 -- Fallback max heap height (metres) if a silo has no interaction trigger node to
 -- read the height from.
 BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
@@ -67,19 +59,26 @@ BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
 -- Set true to print volume/edge/placement diagnostics to the log on each level.
 BunkerAutoLevel.DEBUG = true
 
--- How far (metres) past a short end to probe for a static wall when deciding
--- whether that end is open (slope a drivable ramp) or walled (pack flat).
+-- How far (metres) past an edge the probe box centre sits when looking for a wall.
 BunkerAutoLevel.WALL_PROBE_DISTANCE = 1.0
 
--- Half-thickness (metres) of the overlap box used for the wall probe.
-BunkerAutoLevel.WALL_PROBE_HALF = 0.5
+-- Half-thickness (metres) of the overlap box ALONG the outward normal.
+BunkerAutoLevel.WALL_PROBE_HALF = 0.6
+
+-- Half-span (metres) of the probe box ALONG the edge. SMALL on purpose: probing
+-- only the centre of an edge avoids catching the perpendicular side walls at the
+-- corners (which produced false "walled" on all four edges).
+BunkerAutoLevel.WALL_PROBE_SPAN_HALF = 2.0
+
+-- Vertical half-extent (metres) of the probe box. Tall enough to overlap a wall.
+BunkerAutoLevel.WALL_PROBE_VHALF = 1.5
 
 -- Collision mask for the wall probe: static buildings/objects (bunker walls
 -- register as BUILDING; some custom silos use STATIC_OBJECT too).
 BunkerAutoLevel.WALL_PROBE_MASK = CollisionFlag.BUILDING + CollisionFlag.STATIC_OBJECT
 
 -- Scratch target for the overlap-box callback (avoids per-call allocation).
-BunkerAutoLevel.probeResult = { hit = false }
+BunkerAutoLevel.probeResult = { hit = false, node = nil }
 
 local BunkerAutoLevel_installed = false
 
@@ -311,10 +310,11 @@ function BunkerAutoLevel.redistributeEvenly(silo, fillType, volume)
 
     local radius = DensityMapHeightUtil.getDefaultMaxRadius(fillType) or 1.0
 
-    -- Anchor-and-slope model: dump the whole volume at a single anchor point
-    -- determined by the walls (centre when fully open; against the walled end/
-    -- corner otherwise) and let the engine slope it out at the angle of repose.
-    local placed = BunkerAutoLevel.depositAtAnchor(geo, fillType, radius, volume, edges, true)
+    -- Layered fill: fill the whole footprint to 1m, then 2m, then 3m ... up to the
+    -- cap height, stopping when the material runs out. Each layer is a flat fill at
+    -- its level; the last (partial) layer is laid starting from the walled end so a
+    -- partly-filled silo packs toward the back wall, not the open mouth.
+    local placed = BunkerAutoLevel.depositLayered(geo, fillType, radius, volume, edges, true)
 
     if BunkerAutoLevel.DEBUG then
         Logging.info(
@@ -354,12 +354,21 @@ function BunkerAutoLevel.computeGeometry(silo)
     -- The trigger is placed at the top of the usable silo volume (e.g. y=7 on the
     -- stock medium silo). Fall back to a sane default if no trigger is present.
     local capHeight = BunkerAutoLevel.DEFAULT_MAX_HEIGHT
+    local capSource = "default"
     if silo.interactionTriggerNode ~= nil then
         local _, ty, _ = getWorldTranslation(silo.interactionTriggerNode)
         local h = ty - floorY
         if h > 0.5 then
             capHeight = h
+            capSource = "trigger"
         end
+        if BunkerAutoLevel.DEBUG then
+            Logging.info("[%s]  cap: triggerNode=%s triggerWorldY=%.2f floorY=%.2f h=%.2f -> %s",
+                BunkerAutoLevel.MOD_NAME, tostring(silo.interactionTriggerNode), ty, floorY, h, capSource)
+        end
+    elseif BunkerAutoLevel.DEBUG then
+        Logging.info("[%s]  cap: no interactionTriggerNode -> default %.1fm",
+            BunkerAutoLevel.MOD_NAME, capHeight)
     end
 
     return {
@@ -375,188 +384,160 @@ function BunkerAutoLevel.computeGeometry(silo)
     }
 end
 
---- Overlap-box callback: flag a hit and stop traversal.
-function BunkerAutoLevel.probeCallback(_)
+--- Overlap-box callback: record the FIRST hit node and stop traversal.
+function BunkerAutoLevel.probeCallback(transformId)
     BunkerAutoLevel.probeResult.hit = true
+    BunkerAutoLevel.probeResult.node = transformId
     return false
 end
 
 --- True if the given edge has a static wall just beyond it.
--- @param which "front"/"back" (the short ends, along the length axis) or
---        "left"/"right" (the long sides, along the width axis).
--- Probes an overlap box centred just OUTSIDE that edge, spanning the edge's
--- length, thin in the outward direction. Long-side probes naturally hit the
--- silo's own wallLeft/wallRight collision when present, and find nothing on a
--- wall-less flat pad — exactly the discrimination we want.
+-- @param which "front"/"back" (short ends, along length) or "left"/"right" (long
+--        sides, along width).
+-- Probes a SMALL box centred on the edge MIDPOINT, just outside the edge. Keeping
+-- the box small along the edge avoids catching the perpendicular side walls at the
+-- corners (which falsely reported every edge as walled). A real wall spanning the
+-- end is caught at the midpoint; a wall-less open end / flat pad finds nothing.
 function BunkerAutoLevel.probeEdgeIsWalled(geo, which)
-    -- ecx/ecz = centre of the edge; onx/onz = OUTWARD unit normal of the edge;
-    -- span = full length of the edge (box half-extent along the edge direction).
-    local ecx, ecz, onx, onz, span
+    -- ecx/ecz = edge midpoint; onx/onz = OUTWARD unit normal of the edge.
+    local ecx, ecz, onx, onz
     if which == "front" then
         ecx = geo.sx + 0.5 * geo.dwx
         ecz = geo.sz + 0.5 * geo.dwz
         onx, onz = -geo.lnx, -geo.lnz
-        span = geo.width
     elseif which == "back" then
         ecx = geo.sx + geo.dhx + 0.5 * geo.dwx
         ecz = geo.sz + geo.dhz + 0.5 * geo.dwz
         onx, onz = geo.lnx, geo.lnz
-        span = geo.width
     elseif which == "left" then
         ecx = geo.sx + 0.5 * geo.dhx
         ecz = geo.sz + 0.5 * geo.dhz
         onx, onz = -geo.wnx, -geo.wnz
-        span = geo.length
     else -- "right"
         ecx = geo.sx + geo.dwx + 0.5 * geo.dhx
         ecz = geo.sz + geo.dwz + 0.5 * geo.dhz
         onx, onz = geo.wnx, geo.wnz
-        span = geo.length
     end
 
     local d = BunkerAutoLevel.WALL_PROBE_DISTANCE
-    local px = ecx + onx * (d * 0.5)
-    local pz = ecz + onz * (d * 0.5)
-    local py = DensityMapHeightUtil.getHeightAtWorldPos(px, 0, pz) + 1.0
+    local px = ecx + onx * d
+    local pz = ecz + onz * d
+    local py = DensityMapHeightUtil.getHeightAtWorldPos(px, 0, pz) + BunkerAutoLevel.WALL_PROBE_VHALF
 
-    -- Box local Z aligned to the outward normal: half-extents are
-    -- (along-edge = span/2, vertical = 1.0, outward = WALL_PROBE_HALF).
+    -- Box local Z aligned to the outward normal. Half-extents:
+    --   X (along edge) = WALL_PROBE_SPAN_HALF (small), Y = VHALF, Z (outward) = HALF.
     local rotY = MathUtil.getYRotationFromDirection(onx, onz)
     BunkerAutoLevel.probeResult.hit = false
+    BunkerAutoLevel.probeResult.node = nil
     overlapBox(
         px, py, pz,
         0, rotY, 0,
-        span * 0.5, 1.0, BunkerAutoLevel.WALL_PROBE_HALF,
+        BunkerAutoLevel.WALL_PROBE_SPAN_HALF, BunkerAutoLevel.WALL_PROBE_VHALF, BunkerAutoLevel.WALL_PROBE_HALF,
         "probeCallback", BunkerAutoLevel,
         BunkerAutoLevel.WALL_PROBE_MASK,
         true, true, true
     )
+
+    if BunkerAutoLevel.DEBUG then
+        local nodeName = "-"
+        if BunkerAutoLevel.probeResult.node ~= nil and getName ~= nil then
+            nodeName = getName(BunkerAutoLevel.probeResult.node) or tostring(BunkerAutoLevel.probeResult.node)
+        end
+        Logging.info("[%s]  probe %-5s: walled=%s hit=%s @(%.1f,%.1f,%.1f)",
+            BunkerAutoLevel.MOD_NAME, which, tostring(BunkerAutoLevel.probeResult.hit), nodeName, px, py, pz)
+    end
+
     return BunkerAutoLevel.probeResult.hit
 end
 
---- Compute the anchor distance along an axis given which ends are open/walled.
--- @param len axis length; @param openLow open at offset 0; @param openHigh open at len.
--- Returns the anchor offset along the axis:
---   both open  -> centre (material slopes both ways)
---   one walled -> WALL_OFFSET in from that wall (so the heap also slopes gently
---                 down to the wall, not packed dead flat against it)
---   both walled-> centre
-function BunkerAutoLevel.anchorOnAxis(len, openLow, openHigh)
-    local off = BunkerAutoLevel.WALL_OFFSET
-    if openLow == openHigh then
-        return len * 0.5            -- both open or both walled -> centre
-    elseif not openLow then
-        return math.min(off, len * 0.5)        -- walled at low end -> 1m in from offset 0
-    else
-        return math.max(len - off, len * 0.5)  -- walled at high end -> 1m in from len
-    end
-end
 
---- Deposit the whole `volume` at a single anchor and let the engine slope it out
--- at the natural angle of repose. The anchor is chosen from the walls:
---   * fully open / straight  -> centre of the silo (heap slopes out all ways)
---   * 3-sided [ (one end walled) -> centred across width, near the walled end
---   * L / corner -> in the corner
--- The deposit is done as a SHORT line centred on the anchor (a point-ish source);
--- a large delta naturally forms a cone/ridge that runs downhill toward the open
--- side(s). VOLUME-CONSERVING: places `volume` litres (delta), returns what the
--- engine accepted.
---
--- For big volumes we deposit in several chunks at the same anchor, re-reading the
--- ground between chunks so each chunk slumps outward before the next lands — this
--- spreads the heap toward the open end instead of spiking straight up.
--- @param apply when false, performs a dry-run sum (no ground change).
--- @return total litres placed.
-function BunkerAutoLevel.depositAtAnchor(geo, fillType, radius, volume, edges, apply)
+--- Layered fill: fill the whole footprint to 1m, then 2m, then 3m ... up to the
+-- cap height, stopping when the material runs out. Each layer is a flat fill at
+-- `floorY + level` using limitToLineHeight=true (fill TO a level) but capped by
+-- the remaining volume passed as the delta, so it never creates material. Layers
+-- are laid by sweeping deposit lines that run ALONG the length axis, stepped
+-- across the width. Within the partial top layer the strips are ordered from the
+-- WALLED end first so a partly-filled silo packs toward the back wall.
+-- VOLUME-CONSERVING. @return total litres placed.
+function BunkerAutoLevel.depositLayered(geo, fillType, radius, volume, edges, apply)
     if volume <= 0 then
         return 0
     end
 
-    -- Initial anchor offsets along each axis (1m in from any walled end/corner;
-    -- centre when that axis is open at both ends).
-    local along = BunkerAutoLevel.anchorOnAxis(geo.length, edges.frontOpen, edges.backOpen)
-    local across = BunkerAutoLevel.anchorOnAxis(geo.width, edges.leftOpen, edges.rightOpen)
-
-    -- Direction (along the length axis) the heap should EXTEND once it hits the
-    -- height cap — toward the open end. If the back end is walled and the front is
-    -- open, extend toward the front (-length), and vice versa. If both ends open or
-    -- both walled, don't advance (the heap just grows symmetrically / stays put).
-    local extendSign = 0
-    if edges.backOpen and not edges.frontOpen then
-        extendSign = 1   -- walled front, open back -> extend toward +length (back)
-    elseif edges.frontOpen and not edges.backOpen then
-        extendSign = -1  -- walled back, open front -> extend toward -length (front)
+    -- Footprint band across the width: inset from OPEN long sides so material
+    -- slopes there; run to WALLED sides. Strips run the full length, inset from
+    -- OPEN ends.
+    local margin = BunkerAutoLevel.WALL_OFFSET
+    local leftInset = edges.leftOpen and margin or 0.0
+    local rightInset = edges.rightOpen and margin or 0.0
+    local band = geo.width - leftInset - rightInset
+    if band <= 0 then
+        leftInset, band = geo.width * 0.5, 0.0
     end
 
-    -- Span limits along the length axis so the advancing anchor stays in bounds.
-    local minAlong = BunkerAutoLevel.WALL_OFFSET
-    local maxAlong = geo.length - BunkerAutoLevel.WALL_OFFSET
+    local startDist = edges.frontOpen and margin or 0.0
+    local endDist = math.max(startDist + 0.01, geo.length - (edges.backOpen and margin or 0.0))
 
-    local half = math.min(BunkerAutoLevel.ANCHOR_LINE_HALF, geo.width * 0.5 - 0.1)
-    half = math.max(0.0, half)
+    -- Strip layout across the width.
+    local numLines = (band > 0) and math.max(1, math.floor(band / BunkerAutoLevel.LINE_SPACING + 0.5)) or 1
+    local stepW = (band > 0) and (band / numLines) or 0
 
-    local capY = geo.floorY + geo.capHeight
-    local advanceStep = math.max(radius, BunkerAutoLevel.rampRun(geo.capHeight) * 0.5)
+    -- Which length-end is walled? Lay each layer's lines from the walled end so a
+    -- partial layer fills toward the back wall. We bias by choosing the line's
+    -- "start" of the segment at the walled end (the engine fills from there).
+    -- Strip ordering across width doesn't matter for a full layer; for the partial
+    -- top layer we want material concentrated at the walled END (length axis), and
+    -- tipToGroundAroundLine fills along the whole line, so each line already spans
+    -- the length. To bias toward the walled end we SHORTEN the line for the partial
+    -- layer from the open end inward (handled implicitly by running out of volume).
 
-    local chunks = math.max(1, BunkerAutoLevel.DEPOSIT_CHUNKS)
-    local perChunk = volume / chunks
+    local capLevels = math.max(1, math.floor(geo.capHeight + 0.0001))
+    local remaining = volume
     local totalPlaced = 0
 
-    for _ = 1, chunks do
-        -- Current anchor world position + short cross-width deposit line.
-        local ax = geo.sx + geo.lnx * along + geo.wnx * across
-        local az = geo.sz + geo.lnz * along + geo.wnz * across
-        local sx = ax - geo.wnx * half
-        local sz = az - geo.wnz * half
-        local ex = ax + geo.wnx * half
-        local ez = az + geo.wnz * half
+    for level = 1, capLevels do
+        if remaining <= 0 then break end
+        local lineY = geo.floorY + level
 
-        -- If the heap at the anchor has reached the cap, advance the anchor toward
-        -- the open end so further material EXTENDS the heap rather than piling
-        -- higher than the walls.
-        if extendSign ~= 0 then
-            local peakY = math.max(
-                DensityMapHeightUtil.getHeightAtWorldPos(sx, 0, sz),
-                DensityMapHeightUtil.getHeightAtWorldPos(ex, 0, ez)
-            )
-            if peakY >= capY then
-                along = math.clamp(along + extendSign * advanceStep, minAlong, maxAlong)
-                ax = geo.sx + geo.lnx * along + geo.wnx * across
-                az = geo.sz + geo.lnz * along + geo.wnz * across
-                sx = ax - geo.wnx * half
-                sz = az - geo.wnz * half
-                ex = ax + geo.wnx * half
-                ez = az + geo.wnz * half
+        for i = 0, numLines - 1 do
+            if remaining <= 0 then break end
+            local w = (band > 0) and (leftInset + (i + 0.5) * stepW) or leftInset
+            local bx = geo.sx + geo.wnx * w
+            local bz = geo.sz + geo.wnz * w
+
+            -- Line runs along the length. Order endpoints so the WALLED end is the
+            -- segment start (material fills from there outward on a partial layer).
+            local sDist, eDist = startDist, endDist
+            if edges.frontOpen and not edges.backOpen then
+                sDist, eDist = endDist, startDist   -- back walled -> start at back
             end
+
+            local sx = bx + geo.lnx * sDist
+            local sz = bz + geo.lnz * sDist
+            local ex = bx + geo.lnx * eDist
+            local ez = bz + geo.lnz * eDist
+
+            local placed = DensityMapHeightUtil.tipToGroundAroundLine(
+                nil,            -- vehicle
+                remaining,      -- delta = remaining volume (HARD cap; no creation)
+                fillType,
+                sx, lineY, sz,
+                ex, lineY, ez,
+                0.0,            -- innerRadius
+                radius,         -- radius
+                nil,            -- lineOffset
+                true,           -- limitToLineHeight=true: fill UP TO lineY (this layer)
+                nil,            -- occlusionAreas
+                false,          -- useOcclusionAreas
+                apply           -- applyChanges
+            )
+            placed = placed or 0
+            remaining = remaining - placed
+            totalPlaced = totalPlaced + placed
         end
-
-        -- Re-read ground each chunk so the heap builds on what's already slumped.
-        local sy = DensityMapHeightUtil.getHeightAtWorldPos(sx, 0, sz)
-        local ey = DensityMapHeightUtil.getHeightAtWorldPos(ex, 0, ez)
-
-        local placed = DensityMapHeightUtil.tipToGroundAroundLine(
-            nil,            -- vehicle
-            perChunk,       -- delta to place (litres) -- volume-driven
-            fillType,
-            sx, sy, sz,
-            ex, ey, ez,
-            0.0,            -- innerRadius
-            radius,         -- radius
-            nil,            -- lineOffset
-            false,          -- limitToLineHeight = false: place the AMOUNT, not to a level
-            nil,            -- occlusionAreas
-            false,          -- useOcclusionAreas
-            apply           -- applyChanges
-        )
-        totalPlaced = totalPlaced + (placed or 0)
     end
 
     return totalPlaced
-end
-
---- Ramp run-out (metres) at the natural repose angle for a given height.
-function BunkerAutoLevel.rampRun(height)
-    return height / math.tan(math.rad(40))
 end
 
 -- Bootstrap -----------------------------------------------------------------
