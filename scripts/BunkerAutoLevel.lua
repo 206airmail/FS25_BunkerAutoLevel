@@ -432,25 +432,51 @@ function BunkerAutoLevel.computeGeometry(silo)
     -- node's world Y as the floor reference.
     local floorY = area.sy
 
-    -- Max heap height = the interaction trigger node's height above the floor.
-    -- The trigger is placed at the top of the usable silo volume (e.g. y=7 on the
-    -- stock medium silo). Fall back to a sane default if no trigger is present.
+    -- Max heap height above the floor. Different silos encode the usable height
+    -- differently, so try several sources in order and take the first sane value:
+    --   1. trigger node TRANSLATION Y above floor (stock medium silo: ~7m)
+    --   2. trigger SHAPE vertical reach = bounding-sphere centre.y + radius above
+    --      floor (field silos put the height in the box geometry, node Y at floor)
+    --   3. wallLeft SHAPE vertical reach (a real side wall's top)
+    --   4. DEFAULT_MAX_HEIGHT fallback
     local capHeight = BunkerAutoLevel.DEFAULT_MAX_HEIGHT
     local capSource = "default"
+
+    local function shapeTopAboveFloor(node)
+        if node == nil or getShapeBoundingSphere == nil then return nil end
+        -- bounding sphere centre is in the node's LOCAL frame; convert to world.
+        local lcx, lcy, lcz, r = getShapeBoundingSphere(node)
+        if r == nil or r <= 0 then return nil end
+        local _, wcy, _ = localToWorld(node, lcx, lcy, lcz)
+        return (wcy + r) - floorY
+    end
+
+    local triggerNodeH = nil
     if silo.interactionTriggerNode ~= nil then
         local _, ty, _ = getWorldTranslation(silo.interactionTriggerNode)
-        local h = ty - floorY
-        if h > 0.5 then
-            capHeight = h
-            capSource = "trigger"
+        triggerNodeH = ty - floorY
+        if triggerNodeH > 0.5 then
+            capHeight, capSource = triggerNodeH, "triggerNodeY"
         end
-        if BunkerAutoLevel.DEBUG then
-            Logging.info("[%s]  cap: triggerNode=%s triggerWorldY=%.2f floorY=%.2f h=%.2f -> %s",
-                BunkerAutoLevel.MOD_NAME, tostring(silo.interactionTriggerNode), ty, floorY, h, capSource)
+    end
+
+    if capSource == "default" then
+        local triggerShapeH = shapeTopAboveFloor(silo.interactionTriggerNode)
+        if triggerShapeH ~= nil and triggerShapeH > 0.5 then
+            capHeight, capSource = triggerShapeH, "triggerShape"
         end
-    elseif BunkerAutoLevel.DEBUG then
-        Logging.info("[%s]  cap: no interactionTriggerNode -> default %.1fm",
-            BunkerAutoLevel.MOD_NAME, capHeight)
+    end
+
+    if capSource == "default" and silo.wallLeft ~= nil then
+        local wallH = shapeTopAboveFloor(silo.wallLeft.node)
+        if wallH ~= nil and wallH > 0.5 then
+            capHeight, capSource = wallH, "wallShape"
+        end
+    end
+
+    if BunkerAutoLevel.DEBUG then
+        Logging.info("[%s]  cap: triggerNodeH=%s -> %.2fm (%s)",
+            BunkerAutoLevel.MOD_NAME, tostring(triggerNodeH), capHeight, capSource)
     end
 
     return {
@@ -521,9 +547,12 @@ function BunkerAutoLevel.probeEdgeIsWalled(geo, which)
     )
 
     if BunkerAutoLevel.DEBUG then
+        local node = BunkerAutoLevel.probeResult.node
         local nodeName = "-"
-        if BunkerAutoLevel.probeResult.node ~= nil and getName ~= nil then
-            nodeName = getName(BunkerAutoLevel.probeResult.node) or tostring(BunkerAutoLevel.probeResult.node)
+        if type(node) == "number" and getName ~= nil then
+            nodeName = getName(node) or tostring(node)   -- getName needs an int node id
+        elseif node ~= nil then
+            nodeName = tostring(node)                     -- some hits report a table; don't call getName
         end
         Logging.info("[%s]  probe %-5s: walled=%s hit=%s @(%.1f,%.1f,%.1f)",
             BunkerAutoLevel.MOD_NAME, which, tostring(BunkerAutoLevel.probeResult.hit), nodeName, px, py, pz)
