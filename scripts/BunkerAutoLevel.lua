@@ -67,7 +67,7 @@ BunkerAutoLevel.SMOOTH_PASSES = 15    -- number of smoothing sweeps
 BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
 
 -- Set true to print volume/edge/placement diagnostics to the log on each level.
-BunkerAutoLevel.DEBUG = true
+BunkerAutoLevel.DEBUG = false
 
 -- How far (metres) past an edge the probe box centre sits when looking for a wall.
 BunkerAutoLevel.WALL_PROBE_DISTANCE = 1.0
