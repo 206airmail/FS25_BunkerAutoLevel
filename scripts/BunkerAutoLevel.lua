@@ -49,8 +49,8 @@ BunkerAutoLevel.WALL_OFFSET = 1.0
 
 -- Deposit grid cell size (metres). Footprint is swept as a grid of cells this big;
 -- each cell is capped at its local allowed (crown) height. Smaller = smoother
--- profile, more tip calls.
-BunkerAutoLevel.GRID_STEP = 1.5
+-- profile (shallower inter-cell ridges), more tip calls.
+BunkerAutoLevel.GRID_STEP = 1.0
 
 -- Litres offered per cell tip call (engine caps to the cell's allowed height).
 BunkerAutoLevel.CHUNK_LITERS = 5000.0
@@ -59,9 +59,9 @@ BunkerAutoLevel.CHUNK_LITERS = 5000.0
 -- The whole level op runs in ~10ms, so we can afford heavy smoothing on this
 -- one-shot action.
 BunkerAutoLevel.SMOOTH_STEP = 1.0     -- grid step (m) of the smoothing sweep
-BunkerAutoLevel.SMOOTH_RADIUS = 5.0   -- smoothing kernel radius (m)
+BunkerAutoLevel.SMOOTH_RADIUS = 9.0   -- smoothing kernel radius (m) — wide enough to flatten ridges
 BunkerAutoLevel.SMOOTH_AMOUNT = 1.0   -- 0..1 blend strength per pass
-BunkerAutoLevel.SMOOTH_PASSES = 10    -- number of smoothing sweeps
+BunkerAutoLevel.SMOOTH_PASSES = 15    -- number of smoothing sweeps
 
 -- Fallback max heap height (metres) if a silo's trigger/wall height can't be read.
 BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
