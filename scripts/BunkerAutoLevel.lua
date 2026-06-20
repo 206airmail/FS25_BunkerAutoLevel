@@ -55,6 +55,11 @@ BunkerAutoLevel.GRID_STEP = 1.0
 -- Litres offered per cell tip call (engine caps to the cell's allowed height).
 BunkerAutoLevel.CHUNK_LITERS = 5000.0
 
+-- Each height band is swept repeatedly (repose limits how much stacks per sweep)
+-- until a full sweep places < BAND_STALL_FRACTION of the volume, or this cap.
+BunkerAutoLevel.MAX_BAND_SWEEPS = 12
+BunkerAutoLevel.BAND_STALL_FRACTION = 0.002
+
 -- Post-deposit smoothing (blends the inter-cell ridges/valleys into one surface).
 -- The whole level op runs in ~10ms, so we can afford heavy smoothing on this
 -- one-shot action.
@@ -67,7 +72,7 @@ BunkerAutoLevel.SMOOTH_PASSES = 15    -- number of smoothing sweeps
 BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
 
 -- Set true to print volume/edge/placement diagnostics to the log on each level.
-BunkerAutoLevel.DEBUG = false
+BunkerAutoLevel.DEBUG = true
 
 -- How far (metres) past an edge the probe box centre sits when looking for a wall.
 BunkerAutoLevel.WALL_PROBE_DISTANCE = 1.0
@@ -306,16 +311,19 @@ function BunkerAutoLevel.redistributeEvenly(silo, fillType, volume)
         return volume
     end
 
-    -- Detect which of the four edges are open vs. walled. The base BunkerSilo
-    -- only models the two long side walls, and some silos (flat field pads) have
-    -- NO walls at all, so we probe all four edges for static collision rather than
-    -- assuming. An open edge gets a drivable angle-of-repose ramp; a walled edge
-    -- packs flat against the wall.
+    -- Detect which of the four edges are open vs. walled.
+    -- LONG SIDES (left/right): the base BunkerSilo stores wallLeft/wallRight from
+    -- the silo XML, so we read them directly (reliable) instead of probing — the
+    -- collision probe missed thin/offset side walls. A side is walled if its wall
+    -- node exists AND is visible (extendable silos hide a wall where they join).
+    -- SHORT ENDS (front/back): end walls are NOT in the data (corner / 3-sided
+    -- silos build them as plain collision), so those we still detect by probing.
+    local leftWalled, rightWalled = BunkerAutoLevel.detectSideWalls(silo, geo)
     local edges = {
         frontOpen = not BunkerAutoLevel.probeEdgeIsWalled(geo, "front"),
         backOpen  = not BunkerAutoLevel.probeEdgeIsWalled(geo, "back"),
-        leftOpen  = not BunkerAutoLevel.probeEdgeIsWalled(geo, "left"),
-        rightOpen = not BunkerAutoLevel.probeEdgeIsWalled(geo, "right"),
+        leftOpen  = not leftWalled,
+        rightOpen = not rightWalled,
     }
 
     local radius = DensityMapHeightUtil.getDefaultMaxRadius(fillType) or 1.0
@@ -425,31 +433,45 @@ function BunkerAutoLevel.depositFromAnchor(geo, fillType, radius, volume, edges,
     -- nearest the anchor first so a partial amount makes a centred mound; the band
     -- height is clipped per-cell by the crown cap (c.capH). Inter-cell steps are
     -- blended by the smoothing pass afterwards.
+    -- Raising a cell to its target in one pass is repose-limited: if neighbours are
+    -- still low the engine refuses to stack and returns the unplaced amount. So each
+    -- band is SWEPT REPEATEDLY until it stops accepting (a sweep places ~nothing),
+    -- then we move up a level. Otherwise large volumes leave a big leftover.
     local maxLevels = math.max(1, math.ceil(geo.triggerTop + 0.0001))
     for level = 1, maxLevels do
         if remaining <= 0 then break end
         local bandTop = level
-        for _, c in ipairs(cells) do
-            if remaining <= 0 then break end
-            if c.capH > (level - 1) + 0.01 then       -- cell still rising in this band
-                local cellCapY = geo.floorY + math.min(bandTop, c.capH)
-                local cx = geo.sx + geo.lnx * c.along + geo.wnx * c.across
-                local cz = geo.sz + geo.lnz * c.along + geo.wnz * c.across
-                local sx = cx - geo.wnx * halfC
-                local sz = cz - geo.wnz * halfC
-                local ex = cx + geo.wnx * halfC
-                local ez = cz + geo.wnz * halfC
 
-                local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
-                local placed = DensityMapHeightUtil.tipToGroundAroundLine(
-                    nil, chunk, fillType,
-                    sx, cellCapY, sz, ex, cellCapY, ez,
-                    0.0, radius, nil,
-                    true,            -- limitToLineHeight: cap at this band/crown Y
-                    nil, false, apply)
-                placed = placed or 0
-                remaining = remaining - placed
-                totalPlaced = totalPlaced + placed
+        for _ = 1, BunkerAutoLevel.MAX_BAND_SWEEPS do
+            if remaining <= 0 then break end
+            local sweepPlaced = 0
+            for _, c in ipairs(cells) do
+                if remaining <= 0 then break end
+                if c.capH > (level - 1) + 0.01 then    -- cell still rising in this band
+                    local cellCapY = geo.floorY + math.min(bandTop, c.capH)
+                    local cx = geo.sx + geo.lnx * c.along + geo.wnx * c.across
+                    local cz = geo.sz + geo.lnz * c.along + geo.wnz * c.across
+                    local sx = cx - geo.wnx * halfC
+                    local sz = cz - geo.wnz * halfC
+                    local ex = cx + geo.wnx * halfC
+                    local ez = cz + geo.wnz * halfC
+
+                    local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
+                    local placed = DensityMapHeightUtil.tipToGroundAroundLine(
+                        nil, chunk, fillType,
+                        sx, cellCapY, sz, ex, cellCapY, ez,
+                        0.0, radius, nil,
+                        true,            -- limitToLineHeight: cap at this band/crown Y
+                        nil, false, apply)
+                    placed = placed or 0
+                    remaining = remaining - placed
+                    totalPlaced = totalPlaced + placed
+                    sweepPlaced = sweepPlaced + placed
+                end
+            end
+            -- Band is full once a whole sweep barely placed anything.
+            if sweepPlaced < volume * BunkerAutoLevel.BAND_STALL_FRACTION then
+                break
             end
         end
     end
@@ -591,6 +613,38 @@ function BunkerAutoLevel.computeGeometry(silo)
         lnx = lnx, lnz = lnz,   -- unit dir along length (toward back)
         wnx = wnx, wnz = wnz,   -- unit dir across width (toward right wall)
     }
+end
+
+--- Detect the long side walls from the silo's own data (reliable), mapping each
+-- wall node to the low (across=0) or high (across=width) side by projecting its
+-- world position onto the width axis. A side is walled if a wall node sits on it
+-- AND is visible (extendable silos hide a wall where two silos join).
+-- @return leftWalled (low/across=0 side), rightWalled (high/across=width side)
+function BunkerAutoLevel.detectSideWalls(silo, geo)
+    local lowWalled, highWalled = false, false
+
+    local function classify(w)
+        if w == nil or w.node == nil then return end
+        local visible = (w.visible ~= false)   -- treat nil as visible
+        local wx, _, wz = getWorldTranslation(w.node)
+        -- across offset of this wall along the width axis from the area start.
+        local across = (wx - geo.sx) * geo.wnx + (wz - geo.sz) * geo.wnz
+        if across < geo.width * 0.5 then
+            lowWalled = lowWalled or visible
+        else
+            highWalled = highWalled or visible
+        end
+    end
+
+    classify(silo.wallLeft)
+    classify(silo.wallRight)
+
+    if BunkerAutoLevel.DEBUG then
+        Logging.info("[%s]  sideWalls: low(left)=%s high(right)=%s",
+            BunkerAutoLevel.MOD_NAME, tostring(lowWalled), tostring(highWalled))
+    end
+
+    return lowWalled, highWalled
 end
 
 --- Overlap-box callback: record the FIRST hit node and stop traversal.
