@@ -624,15 +624,37 @@ function BunkerAutoLevel.detectSideWalls(silo, geo)
     local lowWalled, highWalled = false, false
 
     local function classify(w)
-        if w == nil or w.node == nil then return end
+        if w == nil then return end
         local visible = (w.visible ~= false)   -- treat nil as visible
-        local wx, _, wz = getWorldTranslation(w.node)
+        if not visible then return end
+
+        -- The wall NODE sits at the silo origin (mesh is offset), so its
+        -- translation is useless for telling which side it's on. Use the wall
+        -- collision's world AABB CENTRE instead (its true physical position).
+        local wx, wz
+        local cnode = w.collision or w.node
+        if cnode ~= nil and getRigidBodyAABB ~= nil then
+            local minX, maxX, _, _, minZ, maxZ = getRigidBodyAABB(cnode)
+            if minX ~= nil then
+                wx = (minX + maxX) * 0.5
+                wz = (minZ + maxZ) * 0.5
+            end
+        end
+        if wx == nil and w.node ~= nil then
+            wx, _, wz = getWorldTranslation(w.node)
+        end
+        if wx == nil then return end
+
         -- across offset of this wall along the width axis from the area start.
         local across = (wx - geo.sx) * geo.wnx + (wz - geo.sz) * geo.wnz
+        if BunkerAutoLevel.DEBUG then
+            Logging.info("[%s]    wall across=%.1f (width=%.1f)",
+                BunkerAutoLevel.MOD_NAME, across, geo.width)
+        end
         if across < geo.width * 0.5 then
-            lowWalled = lowWalled or visible
+            lowWalled = true
         else
-            highWalled = highWalled or visible
+            highWalled = true
         end
     end
 
