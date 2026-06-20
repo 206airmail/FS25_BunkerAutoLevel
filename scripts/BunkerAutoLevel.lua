@@ -486,6 +486,7 @@ function BunkerAutoLevel.smoothFootprint(geo, edges)
     local smoothRadius = BunkerAutoLevel.SMOOTH_RADIUS
     local smoothAmount = BunkerAutoLevel.SMOOTH_AMOUNT
 
+    local nSmoothed, nNilType, nNoSmooth = 0, 0, 0
     for _ = 1, BunkerAutoLevel.SMOOTH_PASSES do
         for ia = 0, nA - 1 do
             local along = (ia + 0.5) * stepA
@@ -495,16 +496,26 @@ function BunkerAutoLevel.smoothFootprint(geo, edges)
                 local z = geo.sz + geo.lnz * along + geo.wnz * across
                 local y = DensityMapHeightUtil.getHeightAtWorldPos(x, 0, z)
                 local ht = DensityMapHeightUtil.getHeightTypeDescAtWorldPos(x, y, z, smoothRadius)
-                if ht ~= nil and ht.allowsSmoothing then
+                if ht == nil then
+                    nNilType = nNilType + 1
+                elseif not ht.allowsSmoothing then
+                    nNoSmooth = nNoSmooth + 1
+                else
                     smoothDensityMapHeightAtWorldPos(
                         updater,
                         x, y - ht.collisionBaseOffset, z,
                         smoothAmount, ht.index,
                         0, smoothRadius, smoothRadius + 1.2,
                         tireId)
+                    nSmoothed = nSmoothed + 1
                 end
             end
         end
+    end
+
+    if BunkerAutoLevel.DEBUG then
+        Logging.info("[%s]  smooth: ran=%d nilType=%d noSmooth=%d (grid %dx%d, %d passes)",
+            BunkerAutoLevel.MOD_NAME, nSmoothed, nNilType, nNoSmooth, nA, nC, BunkerAutoLevel.SMOOTH_PASSES)
     end
 end
 
