@@ -56,10 +56,12 @@ BunkerAutoLevel.GRID_STEP = 1.5
 BunkerAutoLevel.CHUNK_LITERS = 5000.0
 
 -- Post-deposit smoothing (blends the inter-cell ridges/valleys into one surface).
-BunkerAutoLevel.SMOOTH_STEP = 1.5     -- grid step (m) of the smoothing sweep
-BunkerAutoLevel.SMOOTH_RADIUS = 4.0   -- smoothing kernel radius (m)
+-- The whole level op runs in ~10ms, so we can afford heavy smoothing on this
+-- one-shot action.
+BunkerAutoLevel.SMOOTH_STEP = 1.0     -- grid step (m) of the smoothing sweep
+BunkerAutoLevel.SMOOTH_RADIUS = 5.0   -- smoothing kernel radius (m)
 BunkerAutoLevel.SMOOTH_AMOUNT = 1.0   -- 0..1 blend strength per pass
-BunkerAutoLevel.SMOOTH_PASSES = 5     -- number of smoothing sweeps
+BunkerAutoLevel.SMOOTH_PASSES = 10    -- number of smoothing sweeps
 
 -- Fallback max heap height (metres) if a silo's trigger/wall height can't be read.
 BunkerAutoLevel.DEFAULT_MAX_HEIGHT = 3.0
@@ -418,36 +420,31 @@ function BunkerAutoLevel.depositFromAnchor(geo, fillType, radius, volume, edges,
     local remaining = volume
     local totalPlaced = 0
 
-    -- Fill in 1m height bands from the floor up. In each band, deposit at every cell
-    -- whose allowed height reaches into the band, capped at min(bandTop, cellCap).
-    local maxLevels = math.max(1, math.ceil(geo.triggerTop + 0.0001))
-    for level = 1, maxLevels do
+    -- ONE pass, nearest-anchor first: each cell is filled to its full allowed (crown)
+    -- height in a single tip. Partial volume fills the closest cells first -> centred
+    -- mound; full volume reaches every cell -> flush walls + 45° crown. Band-by-band
+    -- filling caused the row ridging, so we deposit each cell once and let the
+    -- smoothing pass blend neighbours.
+    for _, c in ipairs(cells) do
         if remaining <= 0 then break end
-        local bandTop = level
+        local cellCapY = geo.floorY + c.capH
+        local cx = geo.sx + geo.lnx * c.along + geo.wnx * c.across
+        local cz = geo.sz + geo.lnz * c.along + geo.wnz * c.across
+        local sx = cx - geo.wnx * halfC
+        local sz = cz - geo.wnz * halfC
+        local ex = cx + geo.wnx * halfC
+        local ez = cz + geo.wnz * halfC
 
-        for _, c in ipairs(cells) do
-            if remaining <= 0 then break end
-            if c.capH > (level - 1) + 0.01 then          -- this cell reaches this band
-                local cellCapY = geo.floorY + math.min(bandTop, c.capH)
-                local cx = geo.sx + geo.lnx * c.along + geo.wnx * c.across
-                local cz = geo.sz + geo.lnz * c.along + geo.wnz * c.across
-                local sx = cx - geo.wnx * halfC
-                local sz = cz - geo.wnz * halfC
-                local ex = cx + geo.wnx * halfC
-                local ez = cz + geo.wnz * halfC
-
-                local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
-                local placed = DensityMapHeightUtil.tipToGroundAroundLine(
-                    nil, chunk, fillType,
-                    sx, cellCapY, sz, ex, cellCapY, ez,
-                    0.0, radius, nil,
-                    true,            -- limitToLineHeight: cap at this cell's allowed Y
-                    nil, false, apply)
-                placed = placed or 0
-                remaining = remaining - placed
-                totalPlaced = totalPlaced + placed
-            end
-        end
+        local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
+        local placed = DensityMapHeightUtil.tipToGroundAroundLine(
+            nil, chunk, fillType,
+            sx, cellCapY, sz, ex, cellCapY, ez,
+            0.0, radius, nil,
+            true,            -- limitToLineHeight: cap at this cell's allowed Y
+            nil, false, apply)
+        placed = placed or 0
+        remaining = remaining - placed
+        totalPlaced = totalPlaced + placed
     end
 
     -- Smoothing pass: the grid of capped cell-tips leaves ridges/valleys between
