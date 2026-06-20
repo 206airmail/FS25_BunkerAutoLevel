@@ -420,31 +420,38 @@ function BunkerAutoLevel.depositFromAnchor(geo, fillType, radius, volume, edges,
     local remaining = volume
     local totalPlaced = 0
 
-    -- ONE pass, nearest-anchor first: each cell is filled to its full allowed (crown)
-    -- height in a single tip. Partial volume fills the closest cells first -> centred
-    -- mound; full volume reaches every cell -> flush walls + 45° crown. Band-by-band
-    -- filling caused the row ridging, so we deposit each cell once and let the
-    -- smoothing pass blend neighbours.
-    for _, c in ipairs(cells) do
+    -- BOTTOM-UP fill in 1m bands so the heap height matches the volume (e.g. 50 m³
+    -- in a big silo = a ~1m mound, NOT a tall spike). Within each band, fill cells
+    -- nearest the anchor first so a partial amount makes a centred mound; the band
+    -- height is clipped per-cell by the crown cap (c.capH). Inter-cell steps are
+    -- blended by the smoothing pass afterwards.
+    local maxLevels = math.max(1, math.ceil(geo.triggerTop + 0.0001))
+    for level = 1, maxLevels do
         if remaining <= 0 then break end
-        local cellCapY = geo.floorY + c.capH
-        local cx = geo.sx + geo.lnx * c.along + geo.wnx * c.across
-        local cz = geo.sz + geo.lnz * c.along + geo.wnz * c.across
-        local sx = cx - geo.wnx * halfC
-        local sz = cz - geo.wnz * halfC
-        local ex = cx + geo.wnx * halfC
-        local ez = cz + geo.wnz * halfC
+        local bandTop = level
+        for _, c in ipairs(cells) do
+            if remaining <= 0 then break end
+            if c.capH > (level - 1) + 0.01 then       -- cell still rising in this band
+                local cellCapY = geo.floorY + math.min(bandTop, c.capH)
+                local cx = geo.sx + geo.lnx * c.along + geo.wnx * c.across
+                local cz = geo.sz + geo.lnz * c.along + geo.wnz * c.across
+                local sx = cx - geo.wnx * halfC
+                local sz = cz - geo.wnz * halfC
+                local ex = cx + geo.wnx * halfC
+                local ez = cz + geo.wnz * halfC
 
-        local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
-        local placed = DensityMapHeightUtil.tipToGroundAroundLine(
-            nil, chunk, fillType,
-            sx, cellCapY, sz, ex, cellCapY, ez,
-            0.0, radius, nil,
-            true,            -- limitToLineHeight: cap at this cell's allowed Y
-            nil, false, apply)
-        placed = placed or 0
-        remaining = remaining - placed
-        totalPlaced = totalPlaced + placed
+                local chunk = math.min(remaining, BunkerAutoLevel.CHUNK_LITERS)
+                local placed = DensityMapHeightUtil.tipToGroundAroundLine(
+                    nil, chunk, fillType,
+                    sx, cellCapY, sz, ex, cellCapY, ez,
+                    0.0, radius, nil,
+                    true,            -- limitToLineHeight: cap at this band/crown Y
+                    nil, false, apply)
+                placed = placed or 0
+                remaining = remaining - placed
+                totalPlaced = totalPlaced + placed
+            end
+        end
     end
 
     -- Smoothing pass: the grid of capped cell-tips leaves ridges/valleys between
